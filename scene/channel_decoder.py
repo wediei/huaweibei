@@ -102,19 +102,22 @@ class ChannelDecoder(nn.Module):
       → 合并为复数: H = H_real + 1j * H_imag
     """
 
-    def __init__(self, input_dim, hidden_dims=None, output_shape=(256, 4, 192)):
+    def __init__(self, input_dim, hidden_dims=None, output_shape=(256, 4, 192), rank=16):
         """
         Args:
-            input_dim:  聚合特征维度
+            input_dim:   聚合特征维度
             hidden_dims: MLP 隐藏层维度列表
-            output_shape: 输出信道形状 (bs_ant, ue_ant, subcarrier)
+            output_shape: (bs_ant, ue_ant, subcarrier)
+            rank:         低秩分解秩数 (0=旧式全连接, >0=因子分解)
         """
         super().__init__()
         self.output_shape = output_shape
-        out_features = output_shape[0] * output_shape[1] * output_shape[2]
+        self.rank = rank
+        A, U, S = output_shape
+        self.factored = rank > 0
 
         if hidden_dims is None:
-            hidden_dims = [1024, 1024, 512, 512]
+            hidden_dims = [1024, 512, 256]
 
         # MLP 编码器
         layers = []
@@ -124,51 +127,50 @@ class ChannelDecoder(nn.Module):
                 nn.Linear(prev_dim, h_dim),
                 nn.LayerNorm(h_dim),
                 nn.ReLU(inplace=True),
-                nn.Dropout(0.05),  # 轻量 dropout 防过拟合
+                nn.Dropout(0.1),
             ])
             prev_dim = h_dim
         self.encoder = nn.Sequential(*layers)
 
-        # 输出分支: 实部和虚部
-        self.head_real = nn.Linear(prev_dim, out_features)
-        self.head_imag = nn.Linear(prev_dim, out_features)
+        if self.factored:
+            code_dim = prev_dim
+            for polarity in ['real', 'imag']:
+                setattr(self, f'head_ant_{polarity}', nn.Linear(code_dim, A * rank))
+                setattr(self, f'head_ue_{polarity}',  nn.Linear(code_dim, U * rank))
+                setattr(self, f'head_sc_{polarity}',  nn.Linear(code_dim, S * rank))
+        else:
+            out_features = A * U * S
+            self.head_real = nn.Linear(prev_dim, out_features)
+            self.head_imag = nn.Linear(prev_dim, out_features)
 
-        # Xavier 初始化
+        # Xavier
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.1)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                if m.bias is not None: nn.init.zeros_(m.bias)
 
-        # 可学习的输出缩放因子 — 匹配信道数据的量级 (约 1e-4)
-        self.output_log_scale = nn.Parameter(torch.tensor(-8.0))  # exp(-8) ≈ 3e-4
-
-        print(f"[ChannelDecoder] input_dim={input_dim}, output={output_shape}, "
-              f"params={sum(p.numel() for p in self.parameters()):,}")
+        self.output_log_scale = nn.Parameter(torch.tensor(-8.0))
+        total_p = sum(p.numel() for p in self.parameters())
+        mode = f'factored r={rank}' if self.factored else 'dense'
+        print(f"[ChannelDecoder] {input_dim}→{hidden_dims}→{A}×{U}×{S} {mode}, params={total_p:,}")
 
     def forward(self, x):
-        """
-        Args:
-            x: (B, input_dim) 聚合特征
-
-        Returns:
-            h_real: (B, 256, 4, 192)
-            h_imag: (B, 256, 4, 192)
-        """
-        feat = self.encoder(x)  # (B, hidden[-1])
-
-        # 输出实部和虚部
-        h_real = self.head_real(feat)  # (B, 256*4*192)
-        h_imag = self.head_imag(feat)
-
-        # Reshape
         B = x.shape[0]
-        h_real = h_real.view(B, *self.output_shape)
-        h_imag = h_imag.view(B, *self.output_shape)
-
-        # 应用可学习输出缩放 (匹配真实信道量级 ~1e-4)
+        A, U, S = self.output_shape
+        feat = self.encoder(x)
         scale = torch.exp(self.output_log_scale)
-        h_real = h_real * scale
-        h_imag = h_imag * scale
 
-        return h_real, h_imag
+        if self.factored:
+            R = self.rank
+            outputs = {}
+            for polarity in ['real', 'imag']:
+                ant = getattr(self, f'head_ant_{polarity}')(feat).view(B, A, R)
+                ue  = getattr(self, f'head_ue_{polarity}')(feat).view(B, U, R)
+                sc  = getattr(self, f'head_sc_{polarity}')(feat).view(B, S, R)
+                h = torch.einsum('bir,bjr,bkr->bijk', ant, ue, sc)
+                outputs[polarity] = h * scale
+            return outputs['real'], outputs['imag']
+        else:
+            h_real = self.head_real(feat).view(B, A, U, S) * scale
+            h_imag = self.head_imag(feat).view(B, A, U, S) * scale
+            return h_real, h_imag

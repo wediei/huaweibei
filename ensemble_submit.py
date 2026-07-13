@@ -63,8 +63,9 @@ def build_model(data_dir, train_config, device):
     decoder_input_dim = pe.out_dim + mfd + gfeat_dim
     decoder = ChannelDecoder(
         input_dim=decoder_input_dim,
-        hidden_dims=[1024, 512, 512, 256],
-        output_shape=(256, 4, 192)
+        hidden_dims=[1024, 512, 256],
+        output_shape=(256, 4, 192),
+        rank=train_config.get('rank', 0),
     ).to(device)
 
     aggregator = GaussianFeatureAggregator()

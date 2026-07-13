@@ -372,6 +372,8 @@ def main():
                         help='固定高斯位置在地图几何上 (lr≈0)')
     parser.add_argument('--densify_step', type=int, default=500,
                         help='密度控制间隔 (0=禁用)')
+    parser.add_argument('--rank', type=int, default=16,
+                        help='ChannelDecoder 低秩分解秩数')
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -481,8 +483,9 @@ def main():
         decoder_input_dim += 2
     decoder = ChannelDecoder(
         input_dim=decoder_input_dim,
-        hidden_dims=[1024, 512, 512, 256],
-        output_shape=(256, 4, 192)
+        hidden_dims=[1024, 512, 256],
+        output_shape=(256, 4, 192),
+        rank=getattr(args, 'rank', 16),
     ).to(device)
 
     # ========== 6. 完整模型 (map_encoder=None → 从高斯KNN派生) ==========

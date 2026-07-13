@@ -141,8 +141,9 @@ def main():
 
     decoder = ChannelDecoder(
         input_dim=decoder_input_dim,
-        hidden_dims=[1024, 512, 512, 256],
-        output_shape=(256, 4, 192)
+        hidden_dims=[1024, 512, 256],
+        output_shape=(256, 4, 192),
+        rank=train_config.get('rank', 0),  # 0=旧式全连接
     ).to(device)
 
     aggregator = GaussianFeatureAggregator()
