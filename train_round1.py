@@ -51,7 +51,7 @@ class ChannelPredictionModel(nn.Module):
     """
 
     def __init__(self, gaussian_model, map_encoder, channel_decoder, deform_model,
-                 pos_encoder, gaussian_aggregator):
+                 pos_encoder, gaussian_aggregator, los_encoder=None):
         super().__init__()
         self.gaussian_model = gaussian_model
         self.map_encoder = map_encoder
@@ -59,12 +59,14 @@ class ChannelPredictionModel(nn.Module):
         self.deform_model = deform_model
         self.pos_encoder = pos_encoder
         self.gaussian_aggregator = gaussian_aggregator
+        self.los_encoder = los_encoder  # LOS 可视角编码器 (可选)
 
-    def forward(self, query_pos, return_components=False):
+    def forward(self, query_pos, return_components=False, pos_raw=None):
         """
         Args:
             query_pos: (B, 3) 查询位置 (归一化后)
             return_components: 是否返回中间特征（用于调试）
+            pos_raw: (B, 3) 或 None, 原始坐标 (LOS 需要)
 
         Returns:
             h_pred: (B, 256, 4, 192) complex64 或
@@ -76,11 +78,15 @@ class ChannelPredictionModel(nn.Module):
         # 1) 位置编码 + 地图特征
         pos_enc = self.pos_encoder(query_pos)  # (B, 63)
 
-        # 地图特征: 每个查询位置从 .ply 参考点聚合
-        map_feat = self.map_encoder(query_pos)  # (B, feat_dim)
+        # 地图特征: GeometricFeatureExtractor 需要世界坐标, MapPointFeature 需要归一化坐标
+        if pos_raw is not None and hasattr(self.map_encoder, 'kdtree'):
+            # GeometricFeatureExtractor: 用世界坐标
+            map_feat = self.map_encoder(pos_raw)  # (B, feat_dim)
+        else:
+            # MapPointFeature 或其他: 用归一化坐标
+            map_feat = self.map_encoder(query_pos)  # (B, feat_dim)
 
         # 2) 高斯形变: 查询位置 → per-gaussian 偏移
-        #    扩展 query_pos 到每个高斯: (B, 3) -> (B, N, 3) -> (B*N, 3)
         xyz = self.gaussian_model.get_xyz.detach()  # (N, 3)
         time_input = query_pos.unsqueeze(1).expand(-1, N, -1).reshape(-1, 3)  # (B*N, 3)
         xyz_expand = xyz.unsqueeze(0).expand(B, -1, -1).reshape(-1, 3)  # (B*N, 3)
@@ -88,8 +94,7 @@ class ChannelPredictionModel(nn.Module):
         # 地图特征也扩展到每个高斯
         map_feat_expand = map_feat.unsqueeze(1).expand(-1, N, -1).reshape(-1, map_feat.shape[-1])
 
-        # 注意: self.deform_model 是 DeformNetwork (不是 DeformModel 包装器)
-        # 所以直接调用 forward(), 而非 .step()
+        # 直接调用 DeformNetwork.forward()
         d_xyz, d_rotation, d_scaling, d_signal = self.deform_model(
             xyz_expand, time_input, map_feat=map_feat_expand
         )
@@ -103,29 +108,39 @@ class ChannelPredictionModel(nn.Module):
         feat = self.gaussian_model.get_features
         feat = feat.view(feat.shape[0], -1)  # (N, 3)
 
-        # 信号调制: 将 d_signal 加到高斯特征上
-        # d_signal: (B*N, 3) -> (B, N, 3)
+        # 信号调制
         d_signal_reshaped = d_signal.view(B, N, -1)
         feat_modulated = feat.unsqueeze(0) + d_signal_reshaped  # (B, N, 3)
 
-        # 4) 特征聚合: 对 batch 内每个位置分别加权聚合高斯特征
-        # 使用 vmap 风格处理，避免 for 循环 (但对小 batch 直接 loop 更稳定)
+        # 4) 特征聚合: d_scaling 调制高斯体影响力范围
+        d_scaling_reshaped = d_scaling.view(B, N, -1)  # (B*N, 3) → (B, N, 3)
         agg_feat_list = []
         last_weights = None
         for b in range(B):
+            d_scale_b = d_scaling_reshaped[b]  # (N, 3) 或 None
             feat_b, weights_b = self.gaussian_aggregator(
                 query_pos[b:b+1],  # (1, 3)
                 xyz_deformed[b],   # (N, 3)
                 opacity,
                 scaling,
                 feat_modulated[b],  # (N, 3)
+                d_scaling=d_scale_b if d_scale_b.abs().sum() > 0 else None,
             )
             agg_feat_list.append(feat_b)
             last_weights = weights_b
         agg_feat = torch.cat(agg_feat_list, dim=0)  # (B, 3)
 
-        # 5) 全连接特征: 位置编码 + 地图特征 + 聚合特征
-        decoder_input = torch.cat([pos_enc, map_feat, agg_feat], dim=-1)  # (B, 63+feat_dim+3)
+        # 5) 全连接特征: 位置编码 + 地图特征 + (可选 LOS) + 聚合特征
+        decoder_feat_list = [pos_enc, map_feat, agg_feat]
+
+        # LOS 可视角特征 (需要原始坐标)
+        if self.los_encoder is not None:
+            if pos_raw is None:
+                pos_raw = query_pos
+            los_feat = self.los_encoder(pos_raw)  # (B, 2)
+            decoder_feat_list.append(los_feat)
+
+        decoder_input = torch.cat(decoder_feat_list, dim=-1)
 
         # 6) 信道解码
         h_real, h_imag = self.channel_decoder(decoder_input)  # 各 (B, 256, 4, 192)
@@ -143,27 +158,50 @@ class ChannelPredictionModel(nn.Module):
 
 # ==================== 训练函数 ====================
 
-def train_epoch(model, loader, criterion, optimizer, device, epoch, log_interval=50):
+def train_epoch(model, loader, criterion, optimizer, device, epoch, args=None, pos_mean=None, pos_std=None):
     """训练一个 epoch"""
     model.train()
     total_loss = 0
     total_metrics = {'pas_cos': 0, 'pdp_cos': 0, 'nmse': 0, 'score': 0}
     n_batches = len(loader)
+    log_interval = getattr(args, 'log_interval', 50) if args else 50
 
     pbar = tqdm(loader, desc=f'Epoch {epoch}', leave=False)
     for batch_idx, batch in enumerate(pbar):
         pos, ch_real, ch_imag = batch
         pos = pos.to(device)
-        ch_gt = torch.stack([ch_real, ch_imag], dim=1).to(device)  # (B, 2, 256, 4, 192)
+
+        # 数据增强: 对位置加噪声 (只在训练时)
+        pos_aug = pos
+        if args is not None and getattr(args, 'augment', False):
+            noise = torch.randn_like(pos) * args.augment_std
+            pos_aug = pos + noise
+
+        # 原始坐标 (GeometricFeatureExtractor 和 LOSEncoder 需要世界坐标)
+        pos_raw = None
+        if pos_mean is not None and pos_std is not None:
+            pos_raw = pos_aug * pos_std + pos_mean  # 反标准化到世界坐标
+
+        ch_gt = torch.stack([ch_real, ch_imag], dim=1).to(device)
 
         optimizer.zero_grad()
 
         # 前向
-        h_real, h_imag = model(pos)
-        h_pred = torch.stack([h_real, h_imag], dim=1)  # (B, 2, 256, 4, 192)
+        h_real, h_imag = model(pos_aug, pos_raw=pos_raw)
+        h_pred = torch.stack([h_real, h_imag], dim=1)
 
-        # 损失
+        # 主损失
         loss, loss_dict = criterion(h_pred, ch_gt)
+
+        # 高斯锚定损失 (use_geo 时启用, 每 anchor_interval 步计算一次)
+        if (args is not None and getattr(args, 'use_geo', False) and
+            epoch % getattr(args, 'anchor_interval', 5) == 0):
+            from utils.channel_loss import compute_anchor_loss
+            anchor_loss = compute_anchor_loss(
+                model.gaussian_model.get_xyz, model.map_encoder.kdtree,
+                max_dist=getattr(args, 'anchor_max_dist', 2.0)
+            )
+            loss = loss + args.anchor_weight * anchor_loss
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -247,10 +285,29 @@ def main():
                         help='日志间隔')
     parser.add_argument('--eval_interval', type=int, default=5,
                         help='评估间隔 (epoch)')
+    parser.add_argument('--no_val', action='store_true', default=False,
+                        help='不使用验证集，用全部 2000 样本训练')
     parser.add_argument('--save_interval', type=int, default=20,
                         help='保存间隔 (epoch)')
     parser.add_argument('--resume', type=str, default=None,
                         help='恢复训练的 checkpoint 路径')
+    # 数据增强
+    parser.add_argument('--augment', action='store_true', default=False,
+                        help='训练时对位置加噪声增强')
+    parser.add_argument('--augment_std', type=float, default=0.5,
+                        help='噪声标准差 (米)')
+    # LOS 可视角编码
+    parser.add_argument('--use_los', action='store_true', default=False,
+                        help='使用体素射线可视角编码')
+    # 几何特征编码
+    parser.add_argument('--use_geo', action='store_true', default=False,
+                        help='使用 GeometricFeatureExtractor 替代 MapPointFeature')
+    parser.add_argument('--anchor_weight', type=float, default=0.01,
+                        help='高斯锚定损失权重')
+    parser.add_argument('--anchor_interval', type=int, default=5,
+                        help='锚定损失计算间隔 (epoch)')
+    parser.add_argument('--anchor_max_dist', type=float, default=2.0,
+                        help='最大允许漂移距离 (米)')
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -272,14 +329,38 @@ def main():
     from scene.round1_dataset import Round1Dataset
 
     train_dataset = Round1Dataset(args.data_dir, split='train', normalize_pos=True)
+    # 保存原始位置数据（random_split 后 Subset 不保留 .positions）
+    all_positions = train_dataset.positions.copy()
+
+    if args.no_val:
+        # 全样本训练：不使用验证集
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
+                                  shuffle=True, num_workers=0)
+        val_loader = None
+        best_score = -1.0
+    else:
+        # 从训练集划分验证集 (5%) — 测试集没有信道标签无法评估
+        n_train = len(train_dataset)
+        n_val = max(1, int(n_train * 0.05))
+        n_train_new = n_train - n_val
+        train_subset, val_dataset = torch.utils.data.random_split(
+            train_dataset, [n_train_new, n_val],
+            generator=torch.Generator().manual_seed(args.seed)
+        )
+        # 继承标准化参数
+        val_dataset.dataset.pos_mean = train_dataset.pos_mean
+        val_dataset.dataset.pos_std = train_dataset.pos_std
+
+        train_loader = DataLoader(train_subset, batch_size=args.batch_size,
+                                  shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                                shuffle=False, num_workers=0)
+        best_score = -1.0
+
+    # 测试集加载器 (仅位置，用于最终提交)
     test_dataset = Round1Dataset(args.data_dir, split='test', normalize_pos=True,
                                   pos_mean=train_dataset.pos_mean,
                                   pos_std=train_dataset.pos_std)
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                              shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
-                             shuffle=False, num_workers=0)
 
     pos_mean = torch.from_numpy(train_dataset.pos_mean).float().to(device)
     pos_std = torch.from_numpy(train_dataset.pos_std).float().to(device)
@@ -289,24 +370,32 @@ def main():
     from scene.map_encoder import load_map_pointcloud, MapPointFeature, PositionalEncoder
 
     map_points = load_map_pointcloud(args.data_dir)
-    # 只保留查询区域内的点 (加速)
-    x_min, x_max = train_dataset.positions[:, 0].min(), train_dataset.positions[:, 0].max()
-    y_min, y_max = train_dataset.positions[:, 1].min(), train_dataset.positions[:, 1].max()
+    # 使用 all_positions 裁剪地图（原始完整数据集的范围）
+    x_min, x_max = all_positions[:, 0].min(), all_positions[:, 0].max()
+    y_min, y_max = all_positions[:, 1].min(), all_positions[:, 1].max()
     margin = 20  # 扩展20m
     mask = (map_points[:, 0] >= x_min - margin) & (map_points[:, 0] <= x_max + margin) & \
            (map_points[:, 1] >= y_min - margin) & (map_points[:, 1] <= y_max + margin)
     map_points = map_points[mask]
     print(f'  Cropped map points: {map_points.shape[0]}')
 
-    map_encoder = MapPointFeature(map_points, n_ref_points=args.n_map_ref,
-                                   feature_dim=args.map_feat_dim, knn_k=args.knn_k).to(device)
+    # 地图编码器: 用几何特征还是可学习特征
+    if args.use_geo:
+        from scene.map_encoder import GeometricFeatureExtractor
+        map_encoder = GeometricFeatureExtractor(
+            map_points, feature_dim=args.map_feat_dim, knn_k=args.knn_k,
+            bs_position=[50.0, 0.0, 25.0], ray_width=0.5,
+        ).to(device)
+    else:
+        map_encoder = MapPointFeature(map_points, n_ref_points=args.n_map_ref,
+                                       feature_dim=args.map_feat_dim, knn_k=args.knn_k).to(device)
     pos_encoder = PositionalEncoder(multires=10).to(device)
 
     # ========== 3. 高斯模型初始化 ==========
     print('\n=== Initializing Gaussians ===')
     from scene.gaussian_model import GaussianModel
 
-    scene_extent = np.max(train_dataset.positions.max(axis=0) - train_dataset.positions.min(axis=0))
+    scene_extent = np.max(all_positions.max(axis=0) - all_positions.min(axis=0))
     gaussians = GaussianModel(sh_degree=args.sh_degree, optimizer_type='default')
     # 使用地图点初始化高斯
     gaussians.create_from_map(map_points, n_init=args.n_gaussians,
@@ -323,14 +412,24 @@ def main():
                                 map_feat_dim=args.map_feat_dim,
                                 gaussian_feat_dim=gaussian_feat_dim)
 
+    # ========== 4.5 LOS 可视角编码器 (可选) ==========
+    los_encoder = None
+    if args.use_los:
+        print('\n=== Building LOS Encoder ===')
+        from scene.map_encoder import LOSEncoder
+        los_encoder = LOSEncoder(map_points, bs_position=[50.0, 0.0, 25.0],
+                                  voxel_size=1.0, step_factor=0.5).to(device)
+
     # ========== 5. 聚合器和解码器 ==========
     print('\n=== Building Channel Decoder ===')
     from scene.channel_decoder import GaussianFeatureAggregator, ChannelDecoder
 
     aggregator = GaussianFeatureAggregator()
 
-    # 解码器输入维度 = pos_enc(63) + map_feat + gaussian_agg_feat
+    # 解码器输入维度 = pos_enc(63) + map_feat + gaussian_agg_feat + (可选 LOS 2)
     decoder_input_dim = pos_encoder.out_dim + args.map_feat_dim + gaussian_feat_dim
+    if args.use_los:
+        decoder_input_dim += 2  # LOS 标志 + 遮挡距离
     decoder = ChannelDecoder(
         input_dim=decoder_input_dim,
         hidden_dims=[1024, 512, 512, 256],
@@ -345,6 +444,7 @@ def main():
         deform_model=deform_model.deform,  # 使用内部的 DeformNetwork
         pos_encoder=pos_encoder,
         gaussian_aggregator=aggregator,
+        los_encoder=los_encoder,  # 可能为 None
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -394,7 +494,8 @@ def main():
         t_start = time.time()
 
         train_loss, train_metrics = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, args.log_interval
+            model, train_loader, criterion, optimizer, device, epoch,
+            args=args, pos_mean=pos_mean, pos_std=pos_std,
         )
 
         epoch_time = time.time() - t_start
@@ -418,8 +519,8 @@ def main():
             print(f'  Output scale: {scale_val:.6f}')
 
         # 评估
-        if (epoch + 1) % args.eval_interval == 0 or epoch == args.epochs - 1:
-            eval_loss, eval_metrics = evaluate(model, test_loader, criterion, device)
+        if val_loader is not None and ((epoch + 1) % args.eval_interval == 0 or epoch == args.epochs - 1):
+            eval_loss, eval_metrics = evaluate(model, val_loader, criterion, device)
 
             score = eval_metrics['score']
             eval_msg = (f'  Eval: Loss: {eval_loss:.4f} | '
@@ -458,6 +559,17 @@ def main():
     print(f'\n=== Training Complete ===')
     print(f'Best score: {best_score:.4f}')
     print(f'Output: {output_dir}')
+    # --no_val 模式：保存最终模型
+    if args.no_val:
+        final_path = os.path.join(output_dir, 'checkpoints', 'best_model.pth')
+        torch.save({
+            'epoch': args.epochs - 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_score': -1.0,
+            'args': vars(args),
+        }, final_path)
+        print(f'Final model saved to: {final_path}')
     print(f'Best model: {os.path.join(output_dir, "checkpoints", "best_model.pth")}')
 
 

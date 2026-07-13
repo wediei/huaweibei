@@ -23,9 +23,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 @torch.no_grad()
-def predict_test_set(model, test_loader, device, batch_size=8):
+def predict_test_set(model, test_loader, device, batch_size=8, pos_mean=None, pos_std=None):
     """对测试集进行预测"""
     model.eval()
+
+    pos_mean_t = torch.from_numpy(pos_mean).float().to(device) if pos_mean is not None else None
+    pos_std_t = torch.from_numpy(pos_std).float().to(device) if pos_std is not None else None
 
     all_h_real = []
     all_h_imag = []
@@ -33,7 +36,12 @@ def predict_test_set(model, test_loader, device, batch_size=8):
     for batch in tqdm(test_loader, desc='Predicting'):
         pos = batch.to(device)  # (B, 3)
 
-        h_real, h_imag = model(pos)  # 各 (B, 256, 4, 192)
+        # 原始坐标 (LOS 需要)
+        pos_raw = None
+        if model.los_encoder is not None and pos_mean_t is not None:
+            pos_raw = pos * pos_std_t + pos_mean_t
+
+        h_real, h_imag = model(pos, pos_raw=pos_raw)  # 各 (B, 256, 4, 192)
 
         all_h_real.append(h_real.cpu().numpy())
         all_h_imag.append(h_imag.cpu().numpy())
@@ -118,12 +126,24 @@ def main():
            (map_points[:, 1] >= y_min - 20) & (map_points[:, 1] <= y_max + 20)
     map_points = map_points[mask]
 
-    map_encoder = MapPointFeature(
-        map_points,
-        n_ref_points=train_config.get('n_map_ref', 30000),
-        feature_dim=train_config.get('map_feat_dim', 32),
-        knn_k=train_config.get('knn_k', 16),
-    ).to(device)
+    # 地图编码器: 用几何特征还是可学习特征
+    use_geo = train_config.get('use_geo', False)
+    if use_geo:
+        from scene.map_encoder import GeometricFeatureExtractor
+        map_encoder = GeometricFeatureExtractor(
+            map_points,
+            feature_dim=train_config.get('map_feat_dim', 32),
+            knn_k=train_config.get('knn_k', 32),
+            bs_position=[50.0, 0.0, 25.0],
+            ray_width=0.5,
+        ).to(device)
+    else:
+        map_encoder = MapPointFeature(
+            map_points,
+            n_ref_points=train_config.get('n_map_ref', 30000),
+            feature_dim=train_config.get('map_feat_dim', 32),
+            knn_k=train_config.get('knn_k', 16),
+        ).to(device)
 
     pos_encoder = PositionalEncoder(multires=10).to(device)
 
@@ -135,8 +155,13 @@ def main():
 
     # 解码器
     gaussian_feat_dim = gaussians.get_features.shape[-1]
+    decoder_input_dim = pos_encoder.out_dim + train_config.get('map_feat_dim', 32) + gaussian_feat_dim
+    use_los = train_config.get('use_los', False)
+    if use_los:
+        decoder_input_dim += 2  # LOS 特征
+
     decoder = ChannelDecoder(
-        input_dim=pos_encoder.out_dim + train_config.get('map_feat_dim', 32) + gaussian_feat_dim,
+        input_dim=decoder_input_dim,
         hidden_dims=[1024, 512, 512, 256],
         output_shape=(256, 4, 192)
     ).to(device)
@@ -145,12 +170,19 @@ def main():
 
     # 形变网络 (从 checkpoint 加载)
     from scene.deform_model import DeformModel
-    # 注意: 加载时会自动创建 DeformNetwork
     deform_model = DeformModel(
         is_blender=False, is_6dof=False,
         map_feat_dim=train_config.get('map_feat_dim', 32),
         gaussian_feat_dim=gaussian_feat_dim,
-    ).to(device)
+    )
+
+    # LOS 编码器 (可选)
+    los_encoder = None
+    if use_los:
+        from scene.map_encoder import LOSEncoder
+        print('\n=== Building LOS Encoder ===')
+        los_encoder = LOSEncoder(map_points, bs_position=[50.0, 0.0, 25.0],
+                                  voxel_size=1.0, step_factor=0.5).to(device)
 
     # 完整模型
     model = ChannelPredictionModel(
@@ -160,18 +192,22 @@ def main():
         deform_model=deform_model.deform,
         pos_encoder=pos_encoder,
         gaussian_aggregator=aggregator,
+        los_encoder=los_encoder,
     ).to(device)
 
     # ========== 4. 加载权重 ==========
     print(f'\n=== Loading Checkpoint: {args.checkpoint} ===')
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-    print(f'  Loaded epoch {checkpoint.get("epoch", "?")}, '
-          f'score={checkpoint.get("best_score", "?"):.4f}')
+    loaded_epoch = checkpoint.get("epoch", "?")
+    loaded_score = checkpoint.get("best_score", None)
+    score_str = f'{loaded_score:.4f}' if loaded_score is not None else 'N/A'
+    print(f'  Loaded epoch {loaded_epoch}, score={score_str}')
 
     # ========== 5. 推理 ==========
     print('\n=== Running Inference ===')
-    h_pred = predict_test_set(model, test_loader, device, args.batch_size)
+    h_pred = predict_test_set(model, test_loader, device, args.batch_size,
+                                pos_mean=train_dataset.pos_mean, pos_std=train_dataset.pos_std)
     print(f'  Prediction shape: {h_pred.shape}, dtype={h_pred.dtype}')
 
     # ========== 6. 保存提交 ==========
@@ -186,6 +222,8 @@ def main():
     from utils.channel_loss import ChannelLoss
 
     criterion = ChannelLoss(w_pas=0.4, w_pdp=0.4, w_nmse=0.2, use_real_imag=True).to(device)
+    pos_mean_t = torch.from_numpy(train_dataset.pos_mean).float().to(device)
+    pos_std_t = torch.from_numpy(train_dataset.pos_std).float().to(device)
     model.eval()
 
     all_metrics = {'pas_cos': 0, 'pdp_cos': 0, 'nmse': 0, 'score': 0}
@@ -196,7 +234,10 @@ def main():
         pos = pos.to(device)
         ch_gt = torch.stack([ch_real, ch_imag], dim=1).to(device)
 
-        h_real, h_imag = model(pos)
+        pos_raw = None
+        if model.los_encoder is not None:
+            pos_raw = pos * pos_std_t + pos_mean_t
+        h_real, h_imag = model(pos, pos_raw=pos_raw)
         h_pred = torch.stack([h_real, h_imag], dim=1)
 
         metrics = criterion.compute_metrics(h_pred, ch_gt)

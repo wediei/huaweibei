@@ -35,18 +35,19 @@ class GaussianFeatureAggregator(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, xyz_query, xyz_gaussian, opacity, scaling, features):
+    def forward(self, xyz_query, xyz_gaussian, opacity, scaling, features, d_scaling=None):
         """
         Args:
             xyz_query:   (B, 3) 查询位置
             xyz_gaussian: (N, 3) 高斯中心位置（经过形变后）
             opacity:     (N, 1) 不透明度
             scaling:     (N, 3) 各向异性尺度
-            features:    (N, C_feat) 高斯特征
+            features:    (N, C_feat) 高斯特征 (仅用于直接聚合)
+            d_scaling:   (N, 3) 或 None, DeformNetwork 输出的尺度偏移
 
         Returns:
             agg_feat:    (B, C_feat) 聚合特征
-            weights:     (B, N) 聚合权重（用于可视化/分析）
+            weights:     (B, N) 聚合权重
         """
         B = xyz_query.shape[0]
         N = xyz_gaussian.shape[0]
@@ -55,8 +56,15 @@ class GaussianFeatureAggregator(nn.Module):
         # 距离计算: (B, N)
         dist = torch.cdist(xyz_query, xyz_gaussian, p=2)  # (B, N)
 
-        # 有效尺度: (N,) -> (B, N)
-        scale_eff = scaling.norm(dim=-1)  # (N,)
+        # 有效尺度: 支持 d_scaling 调制 (来自 DeformNetwork 的每查询位置尺度偏移)
+        if d_scaling is not None:
+            # d_scaling: (N, 3), scaling: (N, 3)
+            # 用 0.1 阻尼因子防止尺度突变过大
+            scale_modulated = scaling + 0.1 * d_scaling
+        else:
+            scale_modulated = scaling
+
+        scale_eff = scale_modulated.norm(dim=-1)  # (N,)
         scale_eff = scale_eff.unsqueeze(0).expand(B, -1)  # (B, N)
 
         # 高斯权重: w_i = opacity_i * exp(-d_i² / (2 * sigma_i²))

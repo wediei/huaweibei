@@ -196,3 +196,27 @@ class ChannelLoss(torch.nn.Module):
             'nmse': nmse,
             'score': score,
         }
+
+
+# ========== 高斯锚定损失 ==========
+
+def compute_anchor_loss(gaussian_xyz, kdtree, max_dist=2.0):
+    """
+    铰链损失: 惩罚漂离地图几何超过 max_dist 的高斯点
+
+    每个高斯体应该在原始 .ply 点云的 max_dist 范围内，
+    否则施加线性惩罚。这确保高斯体不脱离物理环境几何。
+
+    Args:
+        gaussian_xyz: (N, 3) torch tensor on GPU, 高斯中心位置
+        kdtree:       scipy.spatial.cKDTree, 原始地图点云的 KD-tree
+        max_dist:     最大允许漂移距离 (米)
+
+    Returns:
+        scalar torch loss (on same device as gaussian_xyz)
+    """
+    import numpy as np
+    xyz_np = gaussian_xyz.detach().cpu().numpy().astype(np.float64)
+    distances, _ = kdtree.query(xyz_np, k=1)
+    distances = torch.from_numpy(distances.astype(np.float32)).to(gaussian_xyz.device)
+    return torch.clamp(distances - max_dist, min=0.0).mean()
