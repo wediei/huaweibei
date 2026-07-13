@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.so
+
+# IDE
+.vscode/
+.idea/
+
+# Data & outputs
+output/
+logs/
+data_test200/
+__pycache__/
+
+# Environment
+.env
+*.conda-env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.claude/
