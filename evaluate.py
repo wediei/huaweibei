@@ -113,12 +113,11 @@ def main():
 
     # ========== 3. 构建模型 ==========
     print('\n=== Building Model ===')
-    from scene.map_encoder import load_map_pointcloud, MapPointFeature, PositionalEncoder
+    from scene.map_encoder import load_map_pointcloud, PositionalEncoder
     from scene.gaussian_model import GaussianModel
     from scene.channel_decoder import GaussianFeatureAggregator, ChannelDecoder
     from train_round1 import ChannelPredictionModel
 
-    # 地图编码器
     map_points = load_map_pointcloud(args.data_dir)
     x_min, x_max = train_dataset.positions[:, 0].min(), train_dataset.positions[:, 0].max()
     y_min, y_max = train_dataset.positions[:, 1].min(), train_dataset.positions[:, 1].max()
@@ -126,39 +125,19 @@ def main():
            (map_points[:, 1] >= y_min - 20) & (map_points[:, 1] <= y_max + 20)
     map_points = map_points[mask]
 
-    # 地图编码器: 用几何特征还是可学习特征
-    use_geo = train_config.get('use_geo', False)
-    if use_geo:
-        from scene.map_encoder import GeometricFeatureExtractor
-        map_encoder = GeometricFeatureExtractor(
-            map_points,
-            feature_dim=train_config.get('map_feat_dim', 32),
-            knn_k=train_config.get('knn_k', 32),
-            bs_position=[50.0, 0.0, 25.0],
-            ray_width=0.5,
-        ).to(device)
-    else:
-        map_encoder = MapPointFeature(
-            map_points,
-            n_ref_points=train_config.get('n_map_ref', 30000),
-            feature_dim=train_config.get('map_feat_dim', 32),
-            knn_k=train_config.get('knn_k', 16),
-        ).to(device)
-
     pos_encoder = PositionalEncoder(multires=10).to(device)
 
-    # 高斯模型
+    # 高斯模型 (从配置文件恢复参数)
+    sh_deg = train_config.get('sh_degree', 1)
     scene_extent = np.max(train_dataset.positions.max(axis=0) - train_dataset.positions.min(axis=0))
-    gaussians = GaussianModel(sh_degree=train_config.get('sh_degree', 0))
+    gaussians = GaussianModel(sh_degree=sh_deg)
     gaussians.create_from_map(map_points, n_init=train_config.get('n_gaussians', 15000),
-                               spatial_lr_scale=scene_extent)
+                               spatial_lr_scale=scene_extent,
+                               sh_degree_override=sh_deg)
 
     # 解码器
     gaussian_feat_dim = gaussians.get_features.shape[-1]
     decoder_input_dim = pos_encoder.out_dim + train_config.get('map_feat_dim', 32) + gaussian_feat_dim
-    use_los = train_config.get('use_los', False)
-    if use_los:
-        decoder_input_dim += 2  # LOS 特征
 
     decoder = ChannelDecoder(
         input_dim=decoder_input_dim,
@@ -168,7 +147,6 @@ def main():
 
     aggregator = GaussianFeatureAggregator()
 
-    # 形变网络 (从 checkpoint 加载)
     from scene.deform_model import DeformModel
     deform_model = DeformModel(
         is_blender=False, is_6dof=False,
@@ -176,23 +154,14 @@ def main():
         gaussian_feat_dim=gaussian_feat_dim,
     )
 
-    # LOS 编码器 (可选)
-    los_encoder = None
-    if use_los:
-        from scene.map_encoder import LOSEncoder
-        print('\n=== Building LOS Encoder ===')
-        los_encoder = LOSEncoder(map_points, bs_position=[50.0, 0.0, 25.0],
-                                  voxel_size=1.0, step_factor=0.5).to(device)
-
-    # 完整模型
+    # map_encoder=None: 地图特征从高斯体 KNN 派生
     model = ChannelPredictionModel(
         gaussian_model=gaussians,
-        map_encoder=map_encoder,
+        map_encoder=None,
         channel_decoder=decoder,
         deform_model=deform_model.deform,
         pos_encoder=pos_encoder,
         gaussian_aggregator=aggregator,
-        los_encoder=los_encoder,
     ).to(device)
 
     # ========== 4. 加载权重 ==========

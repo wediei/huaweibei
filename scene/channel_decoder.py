@@ -18,6 +18,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from utils.general_utils import build_rotation
 
 
 class GaussianFeatureAggregator(nn.Module):
@@ -35,15 +36,18 @@ class GaussianFeatureAggregator(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, xyz_query, xyz_gaussian, opacity, scaling, features, d_scaling=None):
+    def forward(self, xyz_query, xyz_gaussian, opacity, scaling, rotation, features,
+                d_scaling=None, d_rotation=None):
         """
         Args:
             xyz_query:   (B, 3) 查询位置
-            xyz_gaussian: (N, 3) 高斯中心位置（经过形变后）
-            opacity:     (N, 1) 不透明度
-            scaling:     (N, 3) 各向异性尺度
-            features:    (N, C_feat) 高斯特征 (仅用于直接聚合)
-            d_scaling:   (N, 3) 或 None, DeformNetwork 输出的尺度偏移
+            xyz_gaussian: (N, 3) 高斯中心（形变后）
+            opacity:     (N, 1)
+            scaling:     (N, 3) 各向异性尺度 (exp 激活后)
+            rotation:    (N, 4) 旋转四元数 (归一化后)
+            features:    (N, C_feat)
+            d_scaling:   (N, 3) 或 None, DeformNetwork 尺度偏移
+            d_rotation:  (N, 4) 或 None, DeformNetwork 旋转偏移
 
         Returns:
             agg_feat:    (B, C_feat) 聚合特征
@@ -53,30 +57,32 @@ class GaussianFeatureAggregator(nn.Module):
         N = xyz_gaussian.shape[0]
         C = features.shape[-1]
 
-        # 距离计算: (B, N)
-        dist = torch.cdist(xyz_query, xyz_gaussian, p=2)  # (B, N)
+        # 调制尺度与旋转
+        s_mod = scaling + 0.1 * d_scaling if d_scaling is not None else scaling
+        r_mod = rotation + 0.1 * d_rotation if d_rotation is not None else rotation
 
-        # 有效尺度: 支持 d_scaling 调制 (来自 DeformNetwork 的每查询位置尺度偏移)
-        if d_scaling is not None:
-            # d_scaling: (N, 3), scaling: (N, 3)
-            # 用 0.1 阻尼因子防止尺度突变过大
-            scale_modulated = scaling + 0.1 * d_scaling
-        else:
-            scale_modulated = scaling
+        # 构建协方差矩阵 (各向异性): Cov = R * diag(s²) * R^T
+        # Mahalanobis 距离: d² = (q-c)^T * Cov^(-1) * (q-c)
+        # 等效于: d² = ||R^T * (1/s) * (q-c)||²  (白化变换)
+        R = build_rotation(r_mod)  # (N, 3, 3)
+        inv_s = 1.0 / (s_mod + 1e-8)  # (N, 3)
 
-        scale_eff = scale_modulated.norm(dim=-1)  # (N,)
-        scale_eff = scale_eff.unsqueeze(0).expand(B, -1)  # (B, N)
+        # 每对 (b, n) 的加权距离: (B, N)
+        diff = xyz_query.unsqueeze(1) - xyz_gaussian.unsqueeze(0)  # (B, N, 3)
+        # 白化: (B, N, 3) → R^T @ diag(1/s) @ diff
+        diff_rot = torch.einsum('nij,bnj->bni', R, diff)  # (B, N, 3): R^T @ diff
+        diff_white = diff_rot * inv_s.unsqueeze(0)         # (B, N, 3): diag(1/s)
+        mahal_dist2 = (diff_white ** 2).sum(dim=-1)        # (B, N)
 
-        # 高斯权重: w_i = opacity_i * exp(-d_i² / (2 * sigma_i²))
-        sigma2 = scale_eff ** 2 + 1e-8
+        # 高斯权重
         w = opacity.squeeze(-1).unsqueeze(0).expand(B, -1)  # (B, N)
-        w = w * torch.exp(-0.5 * dist ** 2 / sigma2)
+        w = w * torch.exp(-0.5 * mahal_dist2)
 
         # 归一化
-        w_sum = w.sum(dim=-1, keepdim=True) + 1e-8  # (B, 1)
-        w_norm = w / w_sum  # (B, N)
+        w_sum = w.sum(dim=-1, keepdim=True) + 1e-8
+        w_norm = w / w_sum
 
-        # 加权聚合: (B, N) x (N, C) -> (B, C)
+        # 聚合
         feat = features.unsqueeze(0).expand(B, -1, -1)  # (B, N, C)
         agg_feat = torch.bmm(w_norm.unsqueeze(1), feat).squeeze(1)  # (B, C)
 

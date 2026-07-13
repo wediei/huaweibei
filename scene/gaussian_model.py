@@ -191,40 +191,49 @@ class GaussianModel:
         
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
     
-    def create_from_map(self, map_points, n_init=20000, spatial_lr_scale=50.0):
+    def create_from_map(self, map_points, n_init=20000, spatial_lr_scale=50.0,
+                         fix_xyz=False, sh_degree_override=None):
         """
         从地图点云初始化高斯
 
-        从 .ply 地图采样 N 个点作为高斯初始化位置，
-        添加小随机偏移增加多样性，使用 SH degree=0 简化特征。
+        FPS 采样覆盖地图几何表面，每个高斯代表一个物理散射点。
 
         Args:
             map_points: (N_ply, 3) 地图点云坐标 (numpy array)
             n_init: 初始高斯点数
             spatial_lr_scale: 场景空间尺度 (用于学习率缩放)
+            fix_xyz: 是否固定位置 (锚定到地图几何)
+            sh_degree_override: 覆盖 self.max_sh_degree (None=不变)
         """
         self.spatial_lr_scale = spatial_lr_scale
+        if sh_degree_override is not None:
+            self.max_sh_degree = sh_degree_override
 
-        # 从地图点云随机采样
+        sh_d = self.max_sh_degree
+        n_sh = (sh_d + 1) ** 2  # 总 SH 系数: sh_d=0→1, sh_d=1→4
+
+        # FPS 采样覆盖地图几何
         n_ply = map_points.shape[0]
         if n_ply >= n_init:
-            idx = np.random.choice(n_ply, n_init, replace=False)
-            sampled_pts = map_points[idx]
+            from scene.map_encoder import farthest_point_sampling
+            sampled_pts, _ = farthest_point_sampling(map_points, n_init)
         else:
-            # 如果地图点太少，重复采样 + 噪声
             sampled_pts = map_points[np.random.choice(n_ply, n_init, replace=True)]
-            sampled_pts += np.random.randn(n_init, 3) * 0.1
 
-        # 添加小随机偏移 (0.5m)
-        sampled_pts = sampled_pts + np.random.randn(n_init, 3) * 0.5
+        # 微偏移防止尺度崩塌
+        sampled_pts = sampled_pts + np.random.randn(n_init, 3) * 0.1
         fused_point_cloud = torch.tensor(sampled_pts, dtype=torch.float, device="cuda")
 
-        # 简化特征: SH degree=0, 只保留 DC 分量
-        # 特征维度: (N, 3, 1) — 3个颜色通道的DC
-        features = torch.zeros((n_init, 3, 1), dtype=torch.float, device="cuda")
+        # SH 特征: (N, 3, n_sh), DC 随机初始化, 高阶=0
+        features = torch.zeros((n_init, 3, n_sh), dtype=torch.float, device="cuda")
         features[:, :3, 0] = torch.randn(n_init, 3, device="cuda") * 0.1
 
-        print(f"[GaussianModel] Map init: {n_init} points from {n_ply} map points, "
+        n_rest = n_sh - 1  # SH 高阶系数数
+        feat_dim = 3 * n_sh  # 总特征维度: sh_d=0→3, sh_d=1→12
+
+        xyz_grad = not fix_xyz
+        print(f"[GaussianModel] Map init: {n_init} pts (FPS) from {n_ply} map pts, "
+              f"SH deg={sh_d}, feat_dim={feat_dim}, fix_xyz={fix_xyz}, "
               f"spatial_lr_scale={spatial_lr_scale:.1f}")
 
         # 初始化尺度
@@ -241,13 +250,15 @@ class GaussianModel:
         )
 
         # 注册参数
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(xyz_grad))
         self._features_dc = nn.Parameter(
             features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
         )
         self._features_rest = nn.Parameter(
-            torch.zeros((n_init, 3, 0), device="cuda")  # SH 高阶=0
+            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
+            if n_rest > 0 else torch.zeros((n_init, 3, 0), device="cuda")
         )
+
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
