@@ -74,23 +74,27 @@ class GeometryGroundedDecoder(nn.Module):
         )
 
         # ---- 投影头 (共享权重跨 bin) ----
-        out_dim = rank * 2  # 实部 + 虚部
-
+        # 角度: 直接学习 (实部+虚部), PAS 用软分箱没问题
         self.ant_proj_real = nn.Linear(hidden_dim, rank)
         self.ant_proj_imag = nn.Linear(hidden_dim, rank)
-        self.sc_proj_real  = nn.Linear(hidden_dim, rank)
-        self.sc_proj_imag  = nn.Linear(hidden_dim, rank)
-        self.ue_proj_real  = nn.Linear(hidden_dim, ue_ants * rank)
-        self.ue_proj_imag  = nn.Linear(hidden_dim, ue_ants * rank)
+        # 延迟: 只学幅度, 相位由几何延迟 τ_bin 傅里叶确定
+        # 因为 延迟→子载波 是复指数关系: exp(-j·2π·f·τ)
+        self.sc_amplitude_proj = nn.Linear(hidden_dim, rank)
+        # UE: 直接学习
+        self.ue_proj_real = nn.Linear(hidden_dim, ue_ants * rank)
+        self.ue_proj_imag = nn.Linear(hidden_dim, ue_ants * rank)
 
         # ---- 可学习的扩散参数 ----
-        # 角度扩散 (弧度): 每个高斯在角度域的影响宽度
         self.log_angle_spread = nn.Parameter(torch.tensor(-1.0))
-        # 延迟扩散 (秒): 每个高斯在延迟域的影响宽度
         self.log_delay_spread = nn.Parameter(torch.tensor(-16.0))
 
-        # ---- 输出缩放 (同 v4) ----
-        self.output_log_scale = nn.Parameter(torch.tensor(-8.0))
+        # ---- 子载波频率参数 (用于延迟→相位 傅里叶变换) ----
+        # phase[s, bin] = -2π * phase_scale * sc_idx[s] * τ_bin
+        # 其中 phase_scale ∝ 子载波间隔 Δf
+        self.log_phase_scale = nn.Parameter(torch.tensor(0.0))
+
+        # ---- 输出缩放 ----
+        self.output_log_scale = nn.Parameter(torch.tensor(-2.0))  # 更积极的初始值
 
         # ---- 初始化 ----
         for m in self.modules():
@@ -166,14 +170,35 @@ class GeometryGroundedDecoder(nn.Module):
         ant_real = self.ant_proj_real(ant_feat)  # (B, 256, R)
         ant_imag = self.ant_proj_imag(ant_feat)  # (B, 256, R)
 
-        # ---- 3. 延迟软投影 ----
+        # ---- 3. 延迟 → 子载波 (傅里叶相位) ----
+        # 核心: h(sc) = Σ a_p · exp(-j·2π·f_sc·τ_p)
+        # 软分箱只能学幅度, 相位必须由几何 τ 计算
         delay_w = self._soft_project_1d(tau, self.delay_centers,
                                         self.log_delay_spread)  # (B, N, 192)
 
         sc_feat = torch.bmm(delay_w.transpose(1, 2), latent)  # (B, 192, hidden_dim)
 
-        sc_real = self.sc_proj_real(sc_feat)  # (B, 192, R)
-        sc_imag = self.sc_proj_imag(sc_feat)  # (B, 192, R)
+        # 每个延迟 bin 每个 rank 的散射幅度 (非负)
+        sc_amplitude = F.softplus(self.sc_amplitude_proj(sc_feat))  # (B, 192, R)
+
+        # 傅里叶相位: phase[s, bin] = -2π * scale * s * τ_bin
+        # 即: 每个延迟 bin 的贡献以 exp(j·phase) 传播到各子载波
+        phase_scale = torch.exp(self.log_phase_scale)  # 等效 Δf
+        sc_idx = torch.arange(S, device=sc_feat.device).float()  # (192,)
+        tau_bins = self.delay_centers  # (192,)
+
+        # (1, 192, 1, 1) — 子载波索引 × 延迟 bin 中心
+        phase_angle = -2.0 * torch.pi * phase_scale * \
+                      (sc_idx.view(1, S, 1, 1) * tau_bins.view(1, 1, 192, 1))
+        # → (1, 192, 192, 1)
+
+        # 每个 bin-rank 对每个子载波的贡献
+        sc_real_contrib = sc_amplitude.unsqueeze(1) * torch.cos(phase_angle)  # (B, S, 192, R)
+        sc_imag_contrib = sc_amplitude.unsqueeze(1) * torch.sin(phase_angle)  # (B, S, 192, R)
+
+        # 跨 bin 求和 → 子载波因子
+        sc_real = sc_real_contrib.sum(dim=2)  # (B, S, R) = (B, 192, R)
+        sc_imag = sc_imag_contrib.sum(dim=2)  # (B, 192, R)
 
         # ---- 4. UE 因子 (全局池化 + MLP) ----
         ue_feat = latent.mean(dim=1)  # (B, hidden_dim)
