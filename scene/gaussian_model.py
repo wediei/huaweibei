@@ -18,7 +18,21 @@ import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
-from simple_knn._C import distCUDA2
+try:
+    from simple_knn._C import distCUDA2
+except (ImportError, ModuleNotFoundError):
+    # Fallback: pure PyTorch nearest-neighbor distance (slower but portable)
+    def distCUDA2(x):
+        """Approximate nearest-neighbor distance squared (PyTorch fallback)."""
+        with torch.no_grad():
+            # Sample subset for speed
+            n = x.shape[0]
+            k = min(20, n - 1)
+            dists = torch.cdist(x, x)  # (n, n)
+            dists_sorted = torch.topk(dists, k + 1, dim=1, largest=False).values
+            # Skip self-distance (index 0), take mean of k nearest
+            nn_dist = dists_sorted[:, 1:].mean(dim=1)
+        return nn_dist
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 import torch.optim as optim

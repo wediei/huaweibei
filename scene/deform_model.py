@@ -13,9 +13,11 @@ class DeformModel:
 
     比赛版本：支持输入地图特征 + 位置编码
     """
-    def __init__(self, is_blender=True, is_6dof=False, map_feat_dim=0, gaussian_feat_dim=3):
+    def __init__(self, is_blender=True, is_6dof=False, map_feat_dim=0, gaussian_feat_dim=3,
+                 geo_feat_dim=0):
         self.map_feat_dim = map_feat_dim
         self.gaussian_feat_dim = gaussian_feat_dim
+        self.geo_feat_dim = geo_feat_dim
 
         # 判断是否使用地图特征
         use_map = map_feat_dim > 0
@@ -25,24 +27,26 @@ class DeformModel:
             is_6dof=is_6dof,
             use_map_feature=use_map,
             map_feat_dim=map_feat_dim,
-            gaussian_feat_dim=gaussian_feat_dim
+            gaussian_feat_dim=gaussian_feat_dim,
+            geo_feat_dim=geo_feat_dim,
         ).cuda()
         self.optimizer = None
         self.spatial_lr_scale = 5
 
-    def step(self, xyz, time_emb, map_feat=None):
+    def step(self, xyz, time_emb, map_feat=None, geo_feat=None):
         """
         Args:
             xyz:      (N, 3) 高斯位置
             time_emb: (N, 3) 查询位置 (复用原接口名称)
-            map_feat: (1, map_feat_dim) 或 (N, map_feat_dim) 地图特征 (可选)
+            map_feat: (N, map_feat_dim) 或 None 地图特征 (可选)
+            geo_feat: (N, geo_feat_dim) 或 None 几何特征 (可选)
         Returns:
             d_xyz:       (N, 3) 位置偏移
             d_rotation:  (N, 4) 旋转偏移
             d_scaling:   (N, 3) 尺度偏移
-            d_signal:    (N, 3) 信号调制（特征调制）
+            d_signal:    (N, gaussian_feat_dim) 信号调制
         """
-        return self.deform(xyz, time_emb, map_feat)
+        return self.deform(xyz, time_emb, map_feat=map_feat, geo_feat=geo_feat)
 
     def train_setting(self, training_args):
         l = [

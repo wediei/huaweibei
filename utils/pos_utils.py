@@ -58,7 +58,8 @@ class Embedder:
 class DeformNetwork(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, output_ch=59, multires=10,
                  is_blender=True, is_6dof=False,
-                 use_map_feature=False, map_feat_dim=0, gaussian_feat_dim=3):
+                 use_map_feature=False, map_feat_dim=0, gaussian_feat_dim=3,
+                 geo_feat_dim=0):
         """
         可形变网络
 
@@ -73,6 +74,7 @@ class DeformNetwork(nn.Module):
             use_map_feature: 是否使用地图特征
             map_feat_dim: 地图特征维度
             gaussian_feat_dim: 高斯特征调制维度 (d_signal)
+            geo_feat_dim: 几何特征维度 (dir_dep, dir_arr, distances 等, 0=禁用)
         """
         super(DeformNetwork, self).__init__()
         self.D = D
@@ -83,6 +85,7 @@ class DeformNetwork(nn.Module):
         self.is_6dof = is_6dof
         self.use_map_feature = use_map_feature
         self.map_feat_dim = map_feat_dim
+        self.geo_feat_dim = geo_feat_dim
 
         self.t_multires = 6 if is_blender else 10
         self.skips = [D // 2]
@@ -91,10 +94,12 @@ class DeformNetwork(nn.Module):
         self.embed_pos_fn, pos_input_ch = get_embedder(self.t_multires, 3)
         self.embed_fn, xyz_input_ch = get_embedder(multires, 3)
 
-        # 总输入维度 = xyz_pe + pos_pe + (可选) map_feat
+        # 总输入维度 = xyz_pe + pos_pe + (可选) map_feat + (可选) geo_feat
         self.total_input_ch = xyz_input_ch + pos_input_ch
         if use_map_feature and map_feat_dim > 0:
             self.total_input_ch += map_feat_dim
+        if geo_feat_dim > 0:
+            self.total_input_ch += geo_feat_dim
 
         if is_blender:
             self.pos_out = 90
@@ -103,10 +108,12 @@ class DeformNetwork(nn.Module):
                 nn.Linear(pos_input_ch, 256), nn.ReLU(inplace=True),
                 nn.Linear(256, self.pos_out))
 
-            # 最终输入维度: xyz_pe + pos_pe + (可选的) map_feat
+            # 最终输入维度: xyz_pe + pos_pe + (可选的) map_feat + (可选) geo_feat
             final_input_ch = xyz_input_ch + self.pos_out
             if use_map_feature and map_feat_dim > 0:
                 final_input_ch += map_feat_dim
+            if geo_feat_dim > 0:
+                final_input_ch += geo_feat_dim
 
             self.linear = nn.ModuleList(
                 [nn.Linear(final_input_ch, W)] + [
@@ -132,12 +139,13 @@ class DeformNetwork(nn.Module):
         self.gaussian_signal = nn.Linear(W, gaussian_feat_dim)
         # 移除了 gaussian_phase (复数信号调制)
 
-    def forward(self, x, t, map_feat=None):
+    def forward(self, x, t, map_feat=None, geo_feat=None):
         """
         Args:
             x: (N, 3) 高斯位置
             t: (N, 3) 查询位置 (query_pos)
             map_feat: (N, map_feat_dim) 或 None 地图特征
+            geo_feat: (N, geo_feat_dim) 或 None 几何特征 (方向、距离等)
         Returns:
             d_xyz: (N, 3)
             rotation: (N, 4)
@@ -147,37 +155,33 @@ class DeformNetwork(nn.Module):
         t_emb = self.embed_pos_fn(t)
         x_emb = self.embed_fn(x)
 
+        # 快捷函数: 拼接所有特征
+        def _cat_feats(base_list):
+            parts = base_list[:]
+            if map_feat is not None and self.use_map_feature:
+                parts.append(map_feat)
+            if geo_feat is not None and self.geo_feat_dim > 0:
+                parts.append(geo_feat)
+            return torch.cat(parts, dim=-1)
+
         if self.is_blender:
             t_emb = self.posnet(t_emb)
 
-            h = x_emb
-            if map_feat is not None and self.use_map_feature:
-                h = torch.cat([h, t_emb, map_feat], dim=-1)
-            else:
-                h = torch.cat([h, t_emb], dim=-1)
+            h = _cat_feats([x_emb, t_emb])
 
             for i, l in enumerate(self.linear):
                 h = self.linear[i](h)
                 h = F.relu(h)
                 if i in self.skips:
-                    if map_feat is not None and self.use_map_feature:
-                        h = torch.cat([x_emb, t_emb, map_feat, h], -1)
-                    else:
-                        h = torch.cat([x_emb, t_emb, h], -1)
+                    h = _cat_feats([x_emb, t_emb, h])
         else:
-            h = torch.cat([x_emb, t_emb], dim=-1)
-            if map_feat is not None and self.use_map_feature:
-                h = torch.cat([h, map_feat], dim=-1)
+            h = _cat_feats([x_emb, t_emb])
 
             for i, l in enumerate(self.linear):
                 h = self.linear[i](h)
                 h = F.relu(h)
                 if i in self.skips:
-                    skip_input = [x_emb, t_emb]
-                    if map_feat is not None and self.use_map_feature:
-                        skip_input.append(map_feat)
-                    skip_input.append(h)
-                    h = torch.cat(skip_input, -1)
+                    h = _cat_feats([x_emb, t_emb, h])
 
         if self.is_6dof:
             w = self.branch_w(h)

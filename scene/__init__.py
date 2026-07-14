@@ -12,15 +12,30 @@
 import os
 import random
 import json
-from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
-from scene.gaussian_model import GaussianModel
-from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from torch.utils.data import DataLoader
-from scene.dataloader import *
-import yaml
-from scene.deform_model import DeformModel
+
+# 条件导入: 仅在 Linux/CUDA 环境下可用的模块
+try:
+    import yaml
+    from utils.system_utils import searchForMaxIteration
+    from scene.dataset_readers import sceneLoadTypeCallbacks
+    from scene.gaussian_model import GaussianModel
+    from arguments import ModelParams
+    from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+    from scene.dataloader import *
+    from scene.deform_model import DeformModel
+except (ImportError, ModuleNotFoundError) as e:
+    # Windows 开发环境: 这些模块依赖 CUDA 扩展 (simple_knn, diff_gaussian_rasterization, cv2)
+    # 训练脚本直接导入所需模块, 不通过 scene 包
+    print(f'[scene/__init__] Skipping CUDA-dependent imports: {e}')
+    GaussianModel = None
+    DeformModel = None
+    sceneLoadTypeCallbacks = None
+    cameraList_from_camInfos = None
+    camera_to_JSON = None
+    searchForMaxIteration = None
+    ModelParams = None
+    yaml = None
 
 
 class Scene:

@@ -27,11 +27,12 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def build_model(data_dir, train_config, device):
-    """重建单个模型 (与 evaluate.py 逻辑一致，但兼容新旧 checkpoint)"""
+    """重建单个模型 (v5 几何接地版本)"""
     from scene.round1_dataset import Round1Dataset
     from scene.map_encoder import load_map_pointcloud, PositionalEncoder
     from scene.gaussian_model import GaussianModel
-    from scene.channel_decoder import GaussianFeatureAggregator, ChannelDecoder
+    from scene.geometry_encoder import GeometricFeatureComputer
+    from scene.geometry_decoder import GeometryGroundedDecoder
     from train_round1 import ChannelPredictionModel
 
     # 加载标准化参数
@@ -49,64 +50,47 @@ def build_model(data_dir, train_config, device):
     pe = PositionalEncoder(multires=10).to(device)
 
     # 高斯模型
-    sh_deg = train_config.get('sh_degree', 0)
+    sh_deg = train_config.get('sh_degree', 1)
     scene_extent = np.max(ds.positions.max(0) - ds.positions.min(0))
     gaussians = GaussianModel(sh_degree=sh_deg)
     gaussians.create_from_map(map_points, n_init=train_config.get('n_gaussians', 15000),
-                               spatial_lr_scale=scene_extent,
-                               sh_degree_override=sh_deg)
-    gfeat_dim = gaussians.get_features.view(
-        gaussians.get_features.shape[0], -1).shape[-1]
+                               spatial_lr_scale=scene_extent)
+    gfeat_raw = gaussians.get_features
+    sh_dim_total = gfeat_raw.view(gfeat_raw.shape[0], -1).shape[-1]
 
-    # 解码器
-    mfd = train_config.get('map_feat_dim', 32)
-    decoder_input_dim = pe.out_dim + mfd + gfeat_dim
-    decoder = ChannelDecoder(
-        input_dim=decoder_input_dim,
-        hidden_dims=[1024, 512, 256],
-        output_shape=(256, 4, 192),
-        rank=train_config.get('rank', 0),
+    # 几何特征计算器
+    geo_computer = GeometricFeatureComputer(
+        bs_position=(50.0, 0.0, 25.0),
     ).to(device)
 
-    aggregator = GaussianFeatureAggregator()
+    # 几何接地解码器
+    scatter_dim = sh_dim_total + 4
+    decoder = GeometryGroundedDecoder(
+        scatter_dim=scatter_dim,
+        hidden_dim=128,
+        rank=train_config.get('rank', 16),
+        angle_bins=256,
+        delay_bins=192,
+        ue_ants=4,
+    ).to(device)
 
+    # 形变模型
     from scene.deform_model import DeformModel
+    geo_feat_dim = 8
     deform_model = DeformModel(
         is_blender=False, is_6dof=False,
-        map_feat_dim=mfd,
-        gaussian_feat_dim=gfeat_dim,
+        map_feat_dim=0,
+        gaussian_feat_dim=sh_dim_total,
+        geo_feat_dim=geo_feat_dim,
     )
-
-    # 判断是否使用 map_encoder (v3+ 版本 map_encoder=None)
-    use_geo = train_config.get('use_geo', False)
-    if use_geo:
-        from scene.map_encoder import GeometricFeatureExtractor
-        map_encoder = GeometricFeatureExtractor(
-            map_points, feature_dim=mfd,
-            knn_k=train_config.get('knn_k', 32),
-            bs_position=[50.0, 0.0, 25.0], ray_width=0.5,
-        ).to(device)
-    else:
-        sh_deg_check = train_config.get('sh_degree', 0)
-        if sh_deg_check > 0 or train_config.get('fix_xyz', False):
-            map_encoder = None  # v3+: 地图特征从高斯 KNN
-        else:
-            from scene.map_encoder import MapPointFeature
-            map_encoder = MapPointFeature(
-                map_points,
-                n_ref_points=train_config.get('n_map_ref', 30000),
-                feature_dim=mfd,
-                knn_k=train_config.get('knn_k', 16),
-            ).to(device)
 
     model = ChannelPredictionModel(
         gaussian_model=gaussians,
-        map_encoder=map_encoder,
         channel_decoder=decoder,
         deform_model=deform_model.deform,
         pos_encoder=pe,
-        gaussian_aggregator=aggregator,
-        map_feat_dim=mfd,
+        geo_computer=geo_computer,
+        sh_dim_total=sh_dim_total,
     ).to(device)
 
     return model, pos_mean, pos_std
@@ -123,10 +107,8 @@ def predict_single(model, test_loader, pos_mean, pos_std, device):
     for batch in tqdm(test_loader, desc='Predict', leave=False):
         pos = batch.to(device)
 
-        pos_raw = None
-        if getattr(model, 'map_encoder', None) is None:
-            # v3+: 地图特征从高斯 KNN, 需要原始坐标
-            pos_raw = pos * pos_std_t + pos_mean_t
+        # v5: 几何特征需要世界坐标
+        pos_raw = pos * pos_std_t + pos_mean_t
 
         hr, hi = model(pos, pos_raw=pos_raw)
         h_complex = (hr + 1j * hi).cpu().numpy()

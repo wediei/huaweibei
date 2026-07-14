@@ -45,149 +45,92 @@ def set_seed(seed=42):
 
 class ChannelPredictionModel(nn.Module):
     """
-    完整信道预测模型
+    完整信道预测模型 — v5 几何接地版本
 
-    将 MapEncoder + 高斯表征 + DeformNetwork + 聚合 + Decoder 整合
+    架构:
+      1. PositionalEncoder: 查询位置 → 位置编码
+      2. GeometricFeatureComputer: 高斯XYZ + 查询XYZ → 方向/距离/延迟 (0参数, 纯几何)
+      3. DeformNetwork: (高斯XYZ, 查询位置, 几何特征) → per-gaussian 调制 (WRF-GS+ 资产)
+      4. GeometryGroundedDecoder: 散射向量 → 角度/延迟软投影 → CP 重建 → H
     """
 
-    def __init__(self, gaussian_model, map_encoder, channel_decoder, deform_model,
-                 pos_encoder, gaussian_aggregator, map_feat_dim=32):
+    def __init__(self, gaussian_model, channel_decoder, deform_model,
+                 pos_encoder, geo_computer, sh_dim_total):
         super().__init__()
         self.gaussian_model = gaussian_model
-        self.map_encoder = map_encoder   # None = compute from gaussians
-        self.channel_decoder = channel_decoder
-        self.deform_model = deform_model
+        self.channel_decoder = channel_decoder    # GeometryGroundedDecoder
+        self.deform_model = deform_model          # DeformNetwork
         self.pos_encoder = pos_encoder
-        self.gaussian_aggregator = gaussian_aggregator
-        self.map_feat_dim = map_feat_dim
-        # 高斯特征 → 地图特征的投影层 (当 map_encoder=None 时使用)
-        if map_encoder is None:
-            gfeat = gaussian_model.get_features
-            gfeat_dim = gfeat.view(gfeat.shape[0], -1).shape[-1]  # sh_d=1 → 12
-            self.map_proj = nn.Linear(gfeat_dim, map_feat_dim)
+        self.geo_computer = geo_computer          # GeometricFeatureComputer
+        self.sh_dim_total = sh_dim_total          # 总 SH 维度 (sh_d=1→12, sh_d=2→27)
 
     def forward(self, query_pos, return_components=False, pos_raw=None):
         """
         Args:
             query_pos: (B, 3) 查询位置 (归一化后)
-            return_components: 是否返回中间特征（用于调试）
-            pos_raw: (B, 3) 或 None, 原始坐标 (LOS 需要)
+            return_components: 是否返回中间特征
+            pos_raw: (B, 3) 世界坐标 (GeometricFeatureComputer 需要)
 
         Returns:
-            h_pred: (B, 256, 4, 192) complex64 或
-            (h_real, h_imag): (B, 256, 4, 192) float32 × 2
+            (h_real, h_imag): 各 (B, 256, 4, 192)
         """
         B = query_pos.shape[0]
         N = self.gaussian_model.get_xyz.shape[0]
 
-        # 1) 位置编码 + 地图特征
-        pos_enc = self.pos_encoder(query_pos)  # (B, 63)
+        # ---- 1. 几何特征 (地图利用!) ----
+        xyz_world = self.gaussian_model.get_xyz.detach()  # (N, 3) — 被锚定在地图上
+        geo_feats = self.geo_computer(xyz_world, pos_raw)  # dict of (B,N,*) tensors
 
-        # 地图特征: 从附近高斯体 KNN 聚合 (取代 MapPointFeature)
-        if self.map_encoder is not None:
-            map_feat = self.map_encoder(query_pos)  # 兼容旧版
-        else:
-            map_feat = self._gaussian_knn_feat(query_pos)  # 从高斯派生
+        # ---- 2. DeformNetwork: 查询相关的高斯调制 (WRF-GS+ 资产) ----
+        xyz_exp = xyz_world.unsqueeze(0).expand(B, -1, -1).reshape(-1, 3)  # (B*N, 3)
+        pos_exp = query_pos.unsqueeze(1).expand(-1, N, -1).reshape(-1, 3)  # (B*N, 3)
 
-        # 2) 高斯形变
-        xyz = self.gaussian_model.get_xyz.detach()  # (N, 3)
-        time_input = query_pos.unsqueeze(1).expand(-1, N, -1).reshape(-1, 3)  # (B*N, 3)
-        xyz_expand = xyz.unsqueeze(0).expand(B, -1, -1).reshape(-1, 3)  # (B*N, 3)
+        # 几何特征拼接给 DeformNetwork
+        geo_input = torch.cat([
+            geo_feats['dir_dep'].reshape(-1, 3),
+            geo_feats['dir_arr'].reshape(-1, 3),
+            geo_feats['log_d_bs'].reshape(-1, 1),
+            geo_feats['log_d_ue'].reshape(-1, 1),
+        ], dim=-1)  # (B*N, 8)
 
-        map_feat_expand = map_feat.unsqueeze(1).expand(-1, N, -1).reshape(-1, map_feat.shape[-1])
-
-        # 直接调用 DeformNetwork.forward()
         d_xyz, d_rotation, d_scaling, d_signal = self.deform_model(
-            xyz_expand, time_input, map_feat=map_feat_expand
+            xyz_exp, pos_exp, geo_feat=geo_input
         )
 
-        # 3) 应用形变
-        xyz_deformed = xyz.unsqueeze(0) + d_xyz.view(B, N, 3)  # (B, N, 3)
-        scaling = self.gaussian_model.get_scaling  # (N, 3)
-        rotation = self.gaussian_model.get_rotation  # (N, 4)
+        # ---- 3. 构建散射向量 ----
+        # SH 特征 + 调制
+        sh_feat = self.gaussian_model.get_features  # (N, C_sh, 3)
+        sh_flat = sh_feat.view(N, -1).unsqueeze(0).expand(B, -1, -1)  # (B, N, sh_dim)
+
+        d_signal_r = d_signal.view(B, N, -1)  # (B, N, sh_dim)
+        sh_modulated = sh_flat + 0.1 * d_signal_r  # (B, N, sh_dim)
+
+        # 不透明度 (散射强度)
         opacity = self.gaussian_model.get_opacity  # (N, 1)
+        opacity_b = (opacity.squeeze(-1).unsqueeze(0).unsqueeze(-1)
+                     .expand(B, -1, 1))  # (B, N, 1)
 
-        # 高斯特征
-        feat = self.gaussian_model.get_features
-        feat_flat = feat.view(feat.shape[0], -1)  # (N, feat_dim)
+        # 拼接: SH特征 + 不透明度 + 散射角 + 对数距离
+        scatter_vec = torch.cat([
+            sh_modulated,
+            opacity_b,
+            geo_feats['cos_scat'],
+            geo_feats['log_d_bs'],
+            geo_feats['log_d_ue'],
+        ], dim=-1)  # (B, N, sh_dim + 1 + 1 + 1 + 1)
 
-        d_signal_reshaped = d_signal.view(B, N, -1)
-        feat_modulated = feat_flat.unsqueeze(0) + d_signal_reshaped
-
-        # 4) 聚合: 使用 d_scaling + d_rotation 各向异性权重
-        d_scaling_r = d_scaling.view(B, N, -1)
-        d_rotation_r = d_rotation.view(B, N, -1)
-        agg_feat_list = []
-        last_weights = None
-        for b in range(B):
-            feat_b, weights_b = self.gaussian_aggregator(
-                query_pos[b:b+1],
-                xyz_deformed[b],
-                opacity,
-                scaling,
-                rotation,
-                feat_modulated[b],
-                d_scaling=d_scaling_r[b],
-                d_rotation=d_rotation_r[b],
-            )
-            agg_feat_list.append(feat_b)
-            last_weights = weights_b
-        agg_feat = torch.cat(agg_feat_list, dim=0)  # (B, 3)
-
-        # 5) 解码器输入
-        decoder_input = torch.cat([pos_enc, map_feat, agg_feat], dim=-1)
-
-        # 6) 输出
-        h_real, h_imag = self.channel_decoder(decoder_input)  # 各 (B, 256, 4, 192)
+        # ---- 4. 几何接地解码 ----
+        h_real, h_imag = self.channel_decoder(
+            scatter_vec, geo_feats['az_dep'], geo_feats['tau'].squeeze(-1)
+        )
 
         if return_components:
             return h_real, h_imag, {
-                'pos_enc': pos_enc,
-                'map_feat': map_feat,
-                'agg_feat': agg_feat,
-                'weights': last_weights if last_weights is not None else torch.zeros(1),
+                'geo_feats': {k: v for k, v in geo_feats.items()
+                             if isinstance(v, torch.Tensor)},
             }
 
         return h_real, h_imag
-
-    def _gaussian_knn_feat(self, query_pos, K=16):
-        """从最近 K 个高斯反距离加权 → 小MLP → map_feat_dim, 替代 MapPointFeature"""
-        xyz = self.gaussian_model.get_xyz.detach()  # (N, 3)
-        feat = self.gaussian_model.get_features
-        feat_flat = feat.view(feat.shape[0], -1)  # (N, gfeat_dim)
-
-        dist = torch.cdist(query_pos, xyz)  # (B, N)
-        kk = min(K, xyz.shape[0])
-        _, knn_idx = torch.topk(dist, kk, dim=1, largest=False)
-
-        B = query_pos.shape[0]
-        feats = []
-        for b in range(B):
-            idx = knn_idx[b]
-            nf = feat_flat[idx]  # (K, gfeat_dim)
-            d = dist[b, idx] + 1e-8
-            w = 1.0 / d
-            w = w / w.sum()
-            feats.append((w.unsqueeze(0) @ nf).squeeze(0))
-        agg = torch.stack(feats)  # (B, gfeat_dim)
-        return self.map_proj(agg)  # (B, map_feat_dim)
-
-    def _angular_feat(self, query_pos_norm):
-        """BS 视角: 查询位置在 BS 天线阵列中的角坐标"""
-        bs = torch.tensor([50.0, 0.0, 25.0], device=query_pos_norm.device)
-        # 反标准化 (粗略: 使用场景大致尺度)
-        # query_pos_norm is normalized; we need approximate world coords
-        # Use hardcoded stats as fallback
-        diff = query_pos_norm - bs.unsqueeze(0)  # rough, normalized space
-        az = torch.atan2(diff[:, 1], diff[:, 0])  # (-pi, pi)
-        el = torch.atan2(diff[:, 2], torch.norm(diff[:, :2], dim=1))
-        dist = torch.norm(diff, dim=1, keepdim=True)
-        ang = torch.stack([
-            torch.sin(az), torch.cos(az),
-            torch.sin(el), torch.cos(el),
-            dist.squeeze(-1) / 300.0
-        ], dim=-1)
-        return ang  # (B, 5)
 
 
 # ==================== 训练函数 ====================
@@ -286,7 +229,7 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, args=None, p
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, pos_mean=None, pos_std=None):
     """评估模型"""
     model.eval()
     total_metrics = {'pas_cos': 0, 'pdp_cos': 0, 'nmse': 0, 'score': 0}
@@ -298,7 +241,12 @@ def evaluate(model, loader, criterion, device):
         pos = pos.to(device)
         ch_gt = torch.stack([ch_real, ch_imag], dim=1).to(device)
 
-        h_real, h_imag = model(pos)
+        # 计算世界坐标 (几何特征需要)
+        pos_raw = None
+        if pos_mean is not None:
+            pos_raw = pos * pos_std + pos_mean
+
+        h_real, h_imag = model(pos, pos_raw=pos_raw)
         h_pred = torch.stack([h_real, h_imag], dim=1)
 
         loss, _ = criterion(h_pred, ch_gt)
@@ -431,9 +379,9 @@ def main():
     pos_mean = torch.from_numpy(train_dataset.pos_mean).float().to(device)
     pos_std = torch.from_numpy(train_dataset.pos_std).float().to(device)
 
-    # ========== 2. 地图编码器 ==========
-    print('\n=== Building Map Encoder ===')
-    from scene.map_encoder import load_map_pointcloud, MapPointFeature, PositionalEncoder
+    # ========== 2. 地图加载 + 位置编码 ==========
+    print('\n=== Loading Map + PositionalEncoder ===')
+    from scene.map_encoder import load_map_pointcloud, PositionalEncoder
 
     map_points = load_map_pointcloud(args.data_dir)
     # 使用 all_positions 裁剪地图（原始完整数据集的范围）
@@ -458,45 +406,49 @@ def main():
                                fix_xyz=args.fix_xyz,
                                sh_degree_override=args.sh_degree)
     gfeat_raw = gaussians.get_features
-    feat_dim = gfeat_raw.view(gfeat_raw.shape[0], -1).shape[-1]  # sh_d=0→3, sh_d=1→12
-    print(f'  Gaussians: {gaussians.get_xyz.shape[0]} points, feat_dim={feat_dim}')
-    print(f'  Gaussians: {gaussians.get_xyz.shape[0]} points, feat_dim={feat_dim}')
-    # ========== 4. 形变模型 ==========
-    print('\n=== Building Deform Model ===')
-    from scene.deform_model import DeformModel
+    sh_dim_total = gfeat_raw.view(gfeat_raw.shape[0], -1).shape[-1]  # sh_d=1→12, sh_d=2→27
+    print(f'  Gaussians: {gaussians.get_xyz.shape[0]} points, SH dim={sh_dim_total}')
 
-    gaussian_feat_dim = feat_dim  # SH degree=1 → 12维 (而非之前sh_deg=0的3维)
-    map_feat_dim_actual = args.map_feat_dim  # 地图特征维度 (来自高斯KNN聚合)
-    deform_model = DeformModel(is_blender=False, is_6dof=False,
-                                map_feat_dim=map_feat_dim_actual,
-                                gaussian_feat_dim=gaussian_feat_dim)
-
-    # ========== 5. 聚合器和解码器 ==========
-    print('\n=== Building Aggregator + Decoder ===')
-    from scene.channel_decoder import GaussianFeatureAggregator, ChannelDecoder
-
-    aggregator = GaussianFeatureAggregator()
-
-    # 解码器输入 = pos_enc(63) + map_feat(32) + agg_feat(12)
-    decoder_input_dim = pos_encoder.out_dim + map_feat_dim_actual + gaussian_feat_dim
-    if args.use_los:
-        decoder_input_dim += 2
-    decoder = ChannelDecoder(
-        input_dim=decoder_input_dim,
-        hidden_dims=[1024, 512, 256],
-        output_shape=(256, 4, 192),
-        rank=getattr(args, 'rank', 16),
+    # ========== 4. 几何特征计算器 (0 参数, 纯地图利用) ==========
+    print('\n=== Building GeometricFeatureComputer ===')
+    from scene.geometry_encoder import GeometricFeatureComputer
+    geo_computer = GeometricFeatureComputer(
+        bs_position=(50.0, 0.0, 25.0),
     ).to(device)
 
-    # ========== 6. 完整模型 (map_encoder=None → 从高斯KNN派生) ==========
+    # ========== 5. 形变模型 (含几何特征输入) ==========
+    print('\n=== Building Deform Model (with geometry input) ===')
+    from scene.deform_model import DeformModel
+
+    geo_feat_dim = 8  # dir_dep(3) + dir_arr(3) + log_d_bs(1) + log_d_ue(1)
+    deform_model = DeformModel(is_blender=False, is_6dof=False,
+                                map_feat_dim=0,          # 不用 KNN map feat, 用几何特征替代
+                                gaussian_feat_dim=sh_dim_total,
+                                geo_feat_dim=geo_feat_dim)
+
+    # ========== 6. 几何接地解码器 (替代 MLP ChannelDecoder) ==========
+    print('\n=== Building GeometryGroundedDecoder ===')
+    from scene.geometry_decoder import GeometryGroundedDecoder
+
+    scatter_dim = sh_dim_total + 4  # SH + opacity + cos_scat + log_d_bs + log_d_ue
+    decoder = GeometryGroundedDecoder(
+        scatter_dim=scatter_dim,
+        hidden_dim=128,
+        rank=args.rank,
+        angle_bins=256,
+        delay_bins=192,
+        ue_ants=4,
+    ).to(device)
+
+    # ========== 7. 完整模型 ==========
+    print('\n=== Assembling Full Model ===')
     model = ChannelPredictionModel(
         gaussian_model=gaussians,
-        map_encoder=None,
         channel_decoder=decoder,
         deform_model=deform_model.deform,
         pos_encoder=pos_encoder,
-        gaussian_aggregator=aggregator,
-        map_feat_dim=map_feat_dim_actual,
+        geo_computer=geo_computer,
+        sh_dim_total=sh_dim_total,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -572,7 +524,8 @@ def main():
 
         # 评估
         if val_loader is not None and ((epoch + 1) % args.eval_interval == 0 or epoch == args.epochs - 1):
-            eval_loss, eval_metrics = evaluate(model, val_loader, criterion, device)
+            eval_loss, eval_metrics = evaluate(model, val_loader, criterion, device,
+                                                   pos_mean=pos_mean, pos_std=pos_std)
 
             score = eval_metrics['score']
             eval_msg = (f'  Eval: Loss: {eval_loss:.4f} | '

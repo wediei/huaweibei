@@ -36,10 +36,8 @@ def predict_test_set(model, test_loader, device, batch_size=8, pos_mean=None, po
     for batch in tqdm(test_loader, desc='Predicting'):
         pos = batch.to(device)  # (B, 3)
 
-        # 原始坐标 (LOS 需要)
-        pos_raw = None
-        if model.los_encoder is not None and pos_mean_t is not None:
-            pos_raw = pos * pos_std_t + pos_mean_t
+        # v5: 几何特征需要世界坐标
+        pos_raw = pos * pos_std_t + pos_mean_t if pos_mean_t is not None else None
 
         h_real, h_imag = model(pos, pos_raw=pos_raw)  # 各 (B, 256, 4, 192)
 
@@ -115,7 +113,8 @@ def main():
     print('\n=== Building Model ===')
     from scene.map_encoder import load_map_pointcloud, PositionalEncoder
     from scene.gaussian_model import GaussianModel
-    from scene.channel_decoder import GaussianFeatureAggregator, ChannelDecoder
+    from scene.geometry_encoder import GeometricFeatureComputer
+    from scene.geometry_decoder import GeometryGroundedDecoder
     from train_round1 import ChannelPredictionModel
 
     map_points = load_map_pointcloud(args.data_dir)
@@ -135,34 +134,43 @@ def main():
                                spatial_lr_scale=scene_extent,
                                sh_degree_override=sh_deg)
 
-    # 解码器
-    gaussian_feat_dim = gaussians.get_features.shape[-1]
-    decoder_input_dim = pos_encoder.out_dim + train_config.get('map_feat_dim', 32) + gaussian_feat_dim
+    # SH 特征总维度
+    gfeat_raw = gaussians.get_features
+    sh_dim_total = gfeat_raw.view(gfeat_raw.shape[0], -1).shape[-1]  # sh_d=1→12
 
-    decoder = ChannelDecoder(
-        input_dim=decoder_input_dim,
-        hidden_dims=[1024, 512, 256],
-        output_shape=(256, 4, 192),
-        rank=train_config.get('rank', 0),  # 0=旧式全连接
+    # 几何特征计算器 (0 参数)
+    geo_computer = GeometricFeatureComputer(
+        bs_position=(50.0, 0.0, 25.0),
     ).to(device)
 
-    aggregator = GaussianFeatureAggregator()
+    # 几何接地解码器
+    scatter_dim = sh_dim_total + 4  # SH + opacity + cos_scat + log_d_bs + log_d_ue
+    decoder = GeometryGroundedDecoder(
+        scatter_dim=scatter_dim,
+        hidden_dim=128,
+        rank=train_config.get('rank', 16),
+        angle_bins=256,
+        delay_bins=192,
+        ue_ants=4,
+    ).to(device)
 
+    # 形变模型 (含几何特征输入)
     from scene.deform_model import DeformModel
+    geo_feat_dim = 8  # dir_dep(3) + dir_arr(3) + log_d_bs(1) + log_d_ue(1)
     deform_model = DeformModel(
         is_blender=False, is_6dof=False,
-        map_feat_dim=train_config.get('map_feat_dim', 32),
-        gaussian_feat_dim=gaussian_feat_dim,
+        map_feat_dim=0,
+        gaussian_feat_dim=sh_dim_total,
+        geo_feat_dim=geo_feat_dim,
     )
 
-    # map_encoder=None: 地图特征从高斯体 KNN 派生
     model = ChannelPredictionModel(
         gaussian_model=gaussians,
-        map_encoder=None,
         channel_decoder=decoder,
         deform_model=deform_model.deform,
         pos_encoder=pos_encoder,
-        gaussian_aggregator=aggregator,
+        geo_computer=geo_computer,
+        sh_dim_total=sh_dim_total,
     ).to(device)
 
     # ========== 4. 加载权重 ==========
@@ -204,9 +212,7 @@ def main():
         pos = pos.to(device)
         ch_gt = torch.stack([ch_real, ch_imag], dim=1).to(device)
 
-        pos_raw = None
-        if model.los_encoder is not None:
-            pos_raw = pos * pos_std_t + pos_mean_t
+        pos_raw = pos * pos_std_t + pos_mean_t
         h_real, h_imag = model(pos, pos_raw=pos_raw)
         h_pred = torch.stack([h_real, h_imag], dim=1)
 
