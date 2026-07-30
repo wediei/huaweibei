@@ -30,6 +30,7 @@ from .e2e_cgpf_runtime import (
     default_stages,
     load_model_checkpoint,
     make_loader,
+    meets_representation_gate,
     set_deterministic_seed,
     sha256_file,
     write_hash_sidecar,
@@ -73,6 +74,11 @@ def _training_config(args: argparse.Namespace) -> TrainingConfig:
         densify_start_epoch=args.densify_start_epoch,
         densify_interval=args.densify_interval,
         structure_rollback_tolerance=args.structure_rollback_tolerance,
+        early_stop_min_epochs=getattr(args, "early_stop_min_epochs", 0),
+        early_stop_patience=getattr(args, "early_stop_patience", 0),
+        early_stop_min_delta=getattr(args, "early_stop_min_delta", 1e-4),
+        success_threshold=getattr(args, "success_threshold", None),
+        success_patience=getattr(args, "success_patience", 3),
         device=args.device,
     )
 
@@ -165,7 +171,11 @@ def _capacity(args: argparse.Namespace) -> int:
         map_mode="real",
         stages=capacity_stage(args.epochs),
     )
-    metrics = result["best_metrics"]
+    metrics = (
+        result["last_metrics"]
+        if result["stop_reason"] == "success_threshold_stable"
+        else result["best_metrics"]
+    )
     finite = all(
         math.isfinite(float(metrics[name])) for name in ("score", "pas", "pdp", "nmse")
     )
@@ -177,13 +187,7 @@ def _capacity(args: argparse.Namespace) -> int:
         or float(metrics["target_angle_mean_std"]) > 1e-8
         or float(metrics["target_path_energy_std"]) > 1e-8
     )
-    passed = (
-        finite
-        and float(metrics["score"]) >= 0.80
-        and stable_paths
-        and nonzero
-        and target_dependent
-    )
+    passed = meets_representation_gate(metrics, 0.80)
     report = {
         "kind": "representation_capacity",
         "passed": passed,
@@ -608,7 +612,12 @@ def build_parser() -> argparse.ArgumentParser:
     capacity.add_argument("--data-dir", required=True)
     capacity.add_argument("--output-dir", required=True)
     capacity.add_argument("--subset-size", type=int, default=32)
-    capacity.add_argument("--epochs", type=int, default=300)
+    capacity.add_argument("--epochs", type=int, default=180)
+    capacity.add_argument("--early-stop-min-epochs", type=int, default=80)
+    capacity.add_argument("--early-stop-patience", type=int, default=40)
+    capacity.add_argument("--early-stop-min-delta", type=float, default=1e-4)
+    capacity.add_argument("--success-threshold", type=float, default=0.80)
+    capacity.add_argument("--success-patience", type=int, default=3)
     capacity.add_argument("--device", default="auto")
     capacity.add_argument("--seed", type=int, default=42)
     _add_model_training_arguments(capacity)

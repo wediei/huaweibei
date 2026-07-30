@@ -119,6 +119,11 @@ class TrainingConfig:
     densify_start_epoch: int = 20
     densify_interval: int = 5
     structure_rollback_tolerance: float = 0.02
+    early_stop_min_epochs: int = 0
+    early_stop_patience: int = 0
+    early_stop_min_delta: float = 1e-4
+    success_threshold: float | None = None
+    success_patience: int = 3
     device: str = "auto"
 
     def validate(self) -> None:
@@ -133,6 +138,26 @@ class TrainingConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if self.num_workers < 0 or self.densify_start_epoch < 0:
             raise ValueError("worker and epoch counts must be non-negative")
+        if (self.early_stop_min_epochs == 0) != (self.early_stop_patience == 0):
+            raise ValueError(
+                "early_stop_min_epochs and early_stop_patience must both be zero "
+                "or both be positive"
+            )
+        if (
+            isinstance(self.early_stop_min_epochs, bool)
+            or not isinstance(self.early_stop_min_epochs, int)
+            or isinstance(self.early_stop_patience, bool)
+            or not isinstance(self.early_stop_patience, int)
+            or self.early_stop_min_epochs < 0
+            or self.early_stop_patience < 0
+        ):
+            raise ValueError("early stopping epoch counts must be non-negative")
+        if (
+            isinstance(self.success_patience, bool)
+            or not isinstance(self.success_patience, int)
+            or self.success_patience <= 0
+        ):
+            raise ValueError("success_patience must be a positive integer")
         for name in (
             "learning_rate",
             "field_learning_rate",
@@ -142,6 +167,16 @@ class TrainingConfig:
                 raise ValueError(f"{name} must be finite and positive")
         if self.weight_decay < 0 or self.structure_rollback_tolerance < 0:
             raise ValueError("regularization/tolerance values must be non-negative")
+        if (
+            not math.isfinite(float(self.early_stop_min_delta))
+            or self.early_stop_min_delta < 0
+        ):
+            raise ValueError("early_stop_min_delta must be finite and non-negative")
+        if self.success_threshold is not None and (
+            not math.isfinite(float(self.success_threshold))
+            or not 0.0 <= self.success_threshold <= 1.0
+        ):
+            raise ValueError("success_threshold must be finite and in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -170,6 +205,29 @@ def default_stages(epochs_b: int, epochs_c: int, epochs_d: int) -> list[StageSpe
 
 def capacity_stage(epochs: int) -> list[StageSpec]:
     return [StageSpec("A_representation_capacity", "full", epochs, False)]
+
+
+def meets_representation_gate(
+    metrics: dict[str, Any],
+    threshold: float,
+) -> bool:
+    finite = all(
+        math.isfinite(float(metrics[name]))
+        for name in ("score", "pas", "pdp", "nmse")
+    )
+    target_dependent = (
+        int(metrics["target_path_state_unique"]) > 1
+        or float(metrics["target_delay_mean_std"]) > 1e-8
+        or float(metrics["target_angle_mean_std"]) > 1e-8
+        or float(metrics["target_path_energy_std"]) > 1e-8
+    )
+    return (
+        finite
+        and float(metrics["score"]) >= threshold
+        and float(metrics["active_paths_mean"]) >= 2.0
+        and float(metrics["prediction_energy_ratio"]) > 1e-8
+        and target_dependent
+    )
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -710,6 +768,10 @@ class E2ECGPFTrainer:
         overall = tqdm(
             total=total_epochs, desc="E2E-CGPF stages", leave=True, dynamic_ncols=True
         )
+        stop_reason: str | None = None
+        success_streak = 0
+        plateau_bad_epochs = 0
+        plateau_best_score: float | None = None
         try:
             for stage in stages:
                 self._log_text(
@@ -740,6 +802,39 @@ class E2ECGPFTrainer:
                         self.best_score = score
                         self.best_metrics = dict(validation)
                         self.save_checkpoint("best.pt", stage)
+                    if self.training_config.success_threshold is not None:
+                        if meets_representation_gate(
+                            validation,
+                            self.training_config.success_threshold,
+                        ):
+                            success_streak += 1
+                        else:
+                            success_streak = 0
+                        if success_streak >= self.training_config.success_patience:
+                            stop_reason = "success_threshold_stable"
+                    completed_epochs = self.epoch + 1
+                    if (
+                        stop_reason is None
+                        and self.training_config.early_stop_patience > 0
+                        and completed_epochs
+                        >= self.training_config.early_stop_min_epochs
+                    ):
+                        if plateau_best_score is None:
+                            plateau_best_score = self.best_score
+                        elif (
+                            score
+                            > plateau_best_score
+                            + self.training_config.early_stop_min_delta
+                        ):
+                            plateau_best_score = score
+                            plateau_bad_epochs = 0
+                        else:
+                            plateau_bad_epochs += 1
+                            if (
+                                plateau_bad_epochs
+                                >= self.training_config.early_stop_patience
+                            ):
+                                stop_reason = "validation_plateau"
                     self.scheduler.step()
                     self.save_checkpoint("last.pt", stage)
                     record = {
@@ -753,6 +848,11 @@ class E2ECGPFTrainer:
                             group["lr"] for group in self.optimizer.param_groups
                         ],
                         "structure_event": structure_event,
+                        "early_stopping": {
+                            "success_streak": success_streak,
+                            "plateau_bad_epochs": plateau_bad_epochs,
+                            "stop_reason": stop_reason,
+                        },
                     }
                     self._log_metric(record)
                     self._log_text(
@@ -763,6 +863,13 @@ class E2ECGPFTrainer:
                     )
                     overall.update(1)
                     overall.set_postfix(score=f"{score:.4f}", best=f"{self.best_score:.4f}")
+                    if stop_reason is not None:
+                        self._log_text(
+                            f"early_stop epoch={self.epoch + 1} reason={stop_reason} "
+                            f"success_streak={success_streak} "
+                            f"plateau_bad_epochs={plateau_bad_epochs}"
+                        )
+                        break
                 write_json(
                     self.output_dir / f"{stage.name}_report.json",
                     {
@@ -771,8 +878,11 @@ class E2ECGPFTrainer:
                         "best_score": self.best_score,
                         "best_metrics": self.best_metrics,
                         "last_metrics": validation,
+                        "stop_reason": stop_reason,
                     },
                 )
+                if stop_reason is not None:
+                    break
         finally:
             overall.close()
         return {
@@ -780,6 +890,8 @@ class E2ECGPFTrainer:
             "best_metrics": self.best_metrics,
             "last_metrics": validation,
             "epochs_completed": self.epoch + 1,
+            "max_epochs": total_epochs,
+            "stop_reason": stop_reason or "max_epochs_completed",
             "best_checkpoint": str(self.output_dir / "best.pt"),
             "last_checkpoint": str(self.output_dir / "last.pt"),
         }

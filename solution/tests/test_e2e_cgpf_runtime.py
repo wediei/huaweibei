@@ -84,6 +84,21 @@ def make_model() -> E2ECGPF:
 
 
 class RuntimeTests(unittest.TestCase):
+    @staticmethod
+    def _nondegenerate_metrics(score: float) -> dict[str, float | int]:
+        return {
+            "score": score,
+            "pas": score,
+            "pdp": score,
+            "nmse": 0.1,
+            "active_paths_mean": 4.0,
+            "prediction_energy_ratio": 1.0,
+            "target_path_state_unique": 2,
+            "target_delay_mean_std": 0.1,
+            "target_angle_mean_std": 0.1,
+            "target_path_energy_std": 0.1,
+        }
+
     def test_fit_writes_batch_epoch_logs_checkpoints_hashes_and_report(self) -> None:
         model = make_model()
         positions = torch.tensor([[1.0, 0.5, 0.2], [1.5, -0.5, 0.3]])
@@ -160,6 +175,71 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "SHA-256"):
                 load_model_checkpoint(checkpoint, "cpu")
 
+    def test_capacity_stops_after_stable_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = E2ECGPFTrainer(
+                make_model(),
+                TrainingConfig(
+                    device="cpu",
+                    success_threshold=0.8,
+                    success_patience=2,
+                ),
+                E2ECGPFLossConfig(causal_weight=0.0),
+                Path(temporary),
+                train_indices=[0],
+                validation_indices=[0],
+            )
+
+            def train_epoch(*args, **kwargs):
+                trainer.optimizer.zero_grad()
+                trainer.optimizer.step()
+                return {"loss": 0.0}
+
+            trainer.train_epoch = train_epoch
+            trainer.validate = lambda *args, **kwargs: self._nondegenerate_metrics(
+                0.9
+            )
+            result = trainer.fit(
+                [],
+                [],
+                [StageSpec("A_capacity", "full", 10, False)],
+            )
+            self.assertEqual(result["epochs_completed"], 2)
+            self.assertEqual(result["stop_reason"], "success_threshold_stable")
+
+    def test_capacity_plateau_waits_for_minimum_epochs_and_patience(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            trainer = E2ECGPFTrainer(
+                make_model(),
+                TrainingConfig(
+                    device="cpu",
+                    early_stop_min_epochs=2,
+                    early_stop_patience=2,
+                    early_stop_min_delta=1e-3,
+                ),
+                E2ECGPFLossConfig(causal_weight=0.0),
+                Path(temporary),
+                train_indices=[0],
+                validation_indices=[0],
+            )
+
+            def train_epoch(*args, **kwargs):
+                trainer.optimizer.zero_grad()
+                trainer.optimizer.step()
+                return {"loss": 0.0}
+
+            trainer.train_epoch = train_epoch
+            trainer.validate = lambda *args, **kwargs: self._nondegenerate_metrics(
+                0.5
+            )
+            result = trainer.fit(
+                [],
+                [],
+                [StageSpec("A_capacity", "full", 10, False)],
+            )
+            self.assertEqual(result["epochs_completed"], 4)
+            self.assertEqual(result["stop_reason"], "validation_plateau")
+
     def test_official_inference_gate_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             failed = Path(temporary) / "cross_validation_report.json"
@@ -187,6 +267,19 @@ class RuntimeTests(unittest.TestCase):
             "infer",
         ):
             self.assertIn(command, help_text)
+        capacity = parser.parse_args(
+            [
+                "capacity",
+                "--data-dir",
+                "data",
+                "--output-dir",
+                "run",
+            ]
+        )
+        self.assertEqual(capacity.epochs, 180)
+        self.assertEqual(capacity.early_stop_min_epochs, 80)
+        self.assertEqual(capacity.early_stop_patience, 40)
+        self.assertEqual(capacity.success_patience, 3)
 
 
 if __name__ == "__main__":
