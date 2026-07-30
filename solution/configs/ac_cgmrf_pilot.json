@@ -1,0 +1,44 @@
+{
+  "task_id": "020-ac-cgmrf",
+  "stage": "pilot",
+  "seed": 42,
+  "anchor_count": 4,
+  "atom_count": 24,
+  "d_model": 96,
+  "map_hidden_dim": 96,
+  "support": {
+    "horizontal": 3,
+    "vertical": 2,
+    "delay": 4
+  },
+  "max_residual_ratio": 0.35,
+  "support_threshold": 0.001,
+  "phase_unlock_epoch": 5,
+  "energy_warmup_epochs": 8,
+  "epochs": 30,
+  "batch_size": 4,
+  "learning_rate": 0.00005,
+  "weight_decay": 0.0001,
+  "validation_scales": [
+    0.0,
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "pilot_stop_thresholds": {
+    "minimum_o41_gain": 0.01,
+    "minimum_real_over_shuffle": 0.005,
+    "minimum_support_novelty": 0.01
+  },
+  "full_training_thresholds": {
+    "all_spatial_folds_positive": true,
+    "minimum_mean_gain": 0.03,
+    "minimum_stable_configuration_gain": 0.04,
+    "minimum_real_over_zero": 0.01,
+    "minimum_real_over_shuffle": 0.01,
+    "pas_not_lower": true,
+    "pdp_not_lower": true,
+    "nmse_not_worse": true
+  }
+}
