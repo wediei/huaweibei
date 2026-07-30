@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "task_id": "019-o41-provenance-closure",
+  "classification": "PARTIAL",
+  "baseline_acceptance": false,
+  "nodes": [
+    {
+      "id": "commit",
+      "kind": "source",
+      "identity": "e28785d77c843f224bb90645956636a5927f98a1",
+      "status": "verified"
+    },
+    {
+      "id": "server_source",
+      "kind": "source_tree",
+      "identity": "12/12 relevant Git blobs match",
+      "status": "verified"
+    },
+    {
+      "id": "day10",
+      "kind": "checkpoint",
+      "identity": "997ce452b603ae79ad91461cd75ded0c8d9d03ab05d144571b1a75c483e21b24",
+      "status": "verified"
+    },
+    {
+      "id": "day13",
+      "kind": "checkpoint",
+      "identity": "98345beec3f696c38a606826ad86b6524381d24b2a6ee16aabe93ed492284711",
+      "status": "verified"
+    },
+    {
+      "id": "o41",
+      "kind": "checkpoint",
+      "identity": "7d0fe4c3e8fd91511069b4f57dce317d573a230aefb88d33787791b95cf8f783",
+      "status": "verified"
+    },
+    {
+      "id": "fresh_npy",
+      "kind": "output",
+      "identity": "f474dcc61ee5418954a28437bdb09aefdafcfa266559133e130db04c404bfe8c",
+      "status": "verified"
+    },
+    {
+      "id": "retained_npy",
+      "kind": "output",
+      "identity": "f474dcc61ee5418954a28437bdb09aefdafcfa266559133e130db04c404bfe8c",
+      "status": "verified"
+    },
+    {
+      "id": "retained_zip",
+      "kind": "archive",
+      "identity": "40b6654eb24ca5e6195788afb61dbe80971983b8c2c2fefe009d60766f78b1da",
+      "status": "verified"
+    },
+    {
+      "id": "score",
+      "kind": "platform_score",
+      "identity": "0.552317",
+      "status": "unbound_missing_receipt"
+    }
+  ],
+  "edges": [
+    {
+      "from": "commit",
+      "to": "server_source",
+      "relation": "content_equivalent",
+      "evidence": "12/12 SHA-256 matches"
+    },
+    {
+      "from": "server_source",
+      "to": "day10",
+      "relation": "training_source",
+      "evidence": "train report and sidecar"
+    },
+    {
+      "from": "day10",
+      "to": "day13",
+      "relation": "base_checkpoint",
+      "evidence": "day13 report records base SHA-256"
+    },
+    {
+      "from": "day10",
+      "to": "o41",
+      "relation": "frozen_base",
+      "evidence": "inference command"
+    },
+    {
+      "from": "day13",
+      "to": "o41",
+      "relation": "frozen_refiner",
+      "evidence": "inference command"
+    },
+    {
+      "from": "o41",
+      "to": "fresh_npy",
+      "relation": "fresh_inference",
+      "evidence": "infer.log and validation.json"
+    },
+    {
+      "from": "fresh_npy",
+      "to": "retained_npy",
+      "relation": "byte_identical",
+      "evidence": "equal SHA-256"
+    },
+    {
+      "from": "retained_npy",
+      "to": "retained_zip",
+      "relation": "sole_zip_member",
+      "evidence": "member SHA-256 equals NPY"
+    },
+    {
+      "from": "retained_zip",
+      "to": "score",
+      "relation": "claimed_online_result",
+      "evidence": null,
+      "status": "unresolved"
+    }
+  ],
+  "closed_segments": [
+    "commit relevant source -> checkpoints and caches -> fresh NPY",
+    "fresh NPY -> retained NPY -> retained ZIP"
+  ],
+  "open_segments": [
+    "retained artifact -> platform receipt -> score 0.552317"
+  ],
+  "decision_basis": "PARTIAL because exact reproduction is closed but the score-binding platform receipt is missing."
+}
