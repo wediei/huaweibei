@@ -1,0 +1,26 @@
+# Local source/reference assets retained outside the active solution branch.
+.claude/
+.worktrees/
+dataset/
+reference/
+results/
+test/
+
+# Large generated training and evaluation artifacts.
+solution/artifacts/
+solution/runs/
+solution/submissions/
+solution/checkpoints/
+*.npy
+*.npz
+*.pt
+*.pth
+*.zip
+
+# Python and tool caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.codebase-memory/

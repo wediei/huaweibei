@@ -1,0 +1,13 @@
+name: huaweibei-train
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy=1.26
+  - scipy=1.13
+  - tqdm=4.67
+  - pip
+# PyTorch is intentionally excluded.  After `mamba env create`, install the
+# CUDA 11.8 wheels separately:
+# pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
+#   --index-url https://download.pytorch.org/whl/cu118
