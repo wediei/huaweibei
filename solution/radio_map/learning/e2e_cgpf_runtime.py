@@ -720,7 +720,10 @@ class E2ECGPFTrainer:
                     train_metrics = self.train_epoch(
                         train_loader, stage, epoch_in_stage=epoch_in_stage
                     )
-                    validation = self.validate(validation_loader)
+                    validation = self.validate(
+                        validation_loader,
+                        causal_views=self.loss_config.causal_weight > 0.0,
+                    )
                     structure_event = self._maybe_edit_structure(
                         stage,
                         validation_loader,

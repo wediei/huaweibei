@@ -78,7 +78,11 @@ def _training_config(args: argparse.Namespace) -> TrainingConfig:
 
 
 def _loss_config(args: argparse.Namespace, map_mode: str) -> E2ECGPFLossConfig:
-    causal_weight = args.causal_weight if map_mode == "real" else 0.0
+    causal_weight = (
+        args.causal_weight
+        if map_mode == "real" and args.command != "capacity"
+        else 0.0
+    )
     return E2ECGPFLossConfig(
         complex_weight=args.complex_weight,
         pas_weight=args.pas_weight,
